@@ -1,0 +1,17 @@
+{
+  "name": "notificadorpix",
+  "version": "1.0.0",
+  "description": "Monitora Z16010 e enfileira notificações de confirmação PIX",
+  "main": "app.js",
+  "scripts": {
+    "start": "title NotificadorPIX && node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "sequelize": "^6.37.5",
+    "tedious": "^18.6.1",
+    "winston": "^3.17.0"
+  }
+}
