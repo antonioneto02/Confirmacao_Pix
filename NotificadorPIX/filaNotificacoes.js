@@ -1,6 +1,5 @@
 const { Model, DataTypes } = require('sequelize');
 const sequelizeDW = require('./databaseDW');
-
 class FilaNotificacoes extends Model {}
 
 FilaNotificacoes.init({
@@ -20,7 +19,7 @@ FilaNotificacoes.init({
 }, {
     sequelize: sequelizeDW,
     modelName: 'FilaNotificacoes',
-    tableName: 'FATO_FILA_NOTIFICACOES_DEV',
+    tableName: 'FATO_FILA_NOTIFICACOES',
     timestamps: false,
 });
 
