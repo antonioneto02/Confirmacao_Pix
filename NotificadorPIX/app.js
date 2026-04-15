@@ -9,7 +9,7 @@ const FatoCargas = require('./fatoCargas');
 const DimMotoristas = require('./dimMotoristas');
 const FilaNotificacoes = require('./filaNotificacoes');
 const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
-const INTERVALO_POLLING_MS = 30_000;
+const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
 
 // ex: '20260415'
@@ -207,12 +207,19 @@ app.post('/notificar', async (req, res) => {
     }
 });
 
-const LIMITE_POLLING = 100;
-const CONCORRENCIA = 3;     
+const LIMITE_POLLING   = 100;
+const CONCORRENCIA     = 3;
+const INTERVALO_CURTO  = 120_000;   // 2 min — quando há pendentes conhecidos
+const INTERVALO_LONGO  = 600_000;   // 10 min — quando está tudo processado
 
 async function pollingLoop() {
-    logger.info(`[Polling] Iniciado — verificando pendentes a cada ${INTERVALO_POLLING_MS / 1000}s (lote máx: ${LIMITE_POLLING}).`);
+    // Delay inicial aleatório (15-45s) para desincronizar do log-watcher
+    const jitter = 15_000 + Math.floor(Math.random() * 30_000);
+    logger.info(`[Polling] Iniciado — primeiro ciclo em ${Math.round(jitter / 1000)}s.`);
+    await sleep(jitter);
+
     while (true) {
+        let intervalo = INTERVALO_LONGO;
         try {
             limparFalhosExpirados();
 
@@ -234,15 +241,18 @@ async function pollingLoop() {
                 raw: true,
             });
 
-            if (pendentes.length > 0) {
+            if (pendentes.length === 0) {
+                logger.info(`[Polling] ${dataPolling} — nenhum pendente. Próximo em ${INTERVALO_LONGO / 60000} min.`);
+            } else {
+                intervalo = INTERVALO_CURTO; // tem trabalho: volta em 2 min
                 const paraProcessar = pendentes.filter(b =>
                     !txidsBoleto.has(b.Z16_TXID) &&
                     !txidsFalhos.has(b.Z16_TXID) &&
                     !txidsEmProcessamento.has(b.Z16_TXID)
                 );
                 logger.info(
-                    `[Polling] ${dataPolling} — ${pendentes.length} pendente(s) na Z16010, ` +
-                    `${paraProcessar.length} novo(s) para processar.`
+                    `[Polling] ${dataPolling} — ${pendentes.length} pendente(s), ` +
+                    `${paraProcessar.length} novo(s). Próximo em ${intervalo / 60000} min.`
                 );
                 for (let i = 0; i < paraProcessar.length; i += CONCORRENCIA) {
                     const lote = paraProcessar.slice(i, i + CONCORRENCIA);
@@ -259,7 +269,7 @@ async function pollingLoop() {
         } catch (err) {
             logger.error(`[Polling] Erro ao buscar pendentes: ${err.message}`);
         }
-        await sleep(INTERVALO_POLLING_MS);
+        await sleep(intervalo);
     }
 }
 
