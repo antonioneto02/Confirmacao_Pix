@@ -11,6 +11,19 @@ const FilaNotificacoes = require('./filaNotificacoes');
 const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
 const INTERVALO_POLLING_MS = 30_000;
 const PORT = parseInt(process.env.PORT);
+
+// ex: '20260415'
+const POLLING_DATA_FIXA = null;
+
+function getDataPolling() {
+    if (POLLING_DATA_FIXA) return POLLING_DATA_FIXA;
+    const hoje = new Date();
+    const ano = hoje.getFullYear();
+    const mes = String(hoje.getMonth() + 1).padStart(2, '0');
+    const dia = String(hoje.getDate()).padStart(2, '0');
+    return `${ano}${mes}${dia}`;
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const txidsEmProcessamento = new Set();
 const txidsPendentesPolling = new Set();
@@ -203,10 +216,12 @@ async function pollingLoop() {
         try {
             limparFalhosExpirados();
 
+            const dataPolling = getDataPolling();
             const pendentes = await Z16010.findAll({
                 attributes: ['Z16_TXID'],
                 where: {
                     Z16_STENVW: '0',
+                    Z16_DTBAIX: dataPolling,
                     Z16_TXID: {
                         [Op.and]: [
                             { [Op.ne]: null },
@@ -226,7 +241,7 @@ async function pollingLoop() {
                     !txidsEmProcessamento.has(b.Z16_TXID)
                 );
                 logger.info(
-                    `[Polling] ${pendentes.length} pendente(s) na Z16010 — ` +
+                    `[Polling] ${dataPolling} — ${pendentes.length} pendente(s) na Z16010, ` +
                     `${paraProcessar.length} novo(s) para processar.`
                 );
                 for (let i = 0; i < paraProcessar.length; i += CONCORRENCIA) {
