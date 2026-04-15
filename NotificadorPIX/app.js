@@ -44,7 +44,7 @@ async function enfileirarAlertaGoogleChat(mensagem) {
     }
 }
 
-async function processarTxid(txid) {
+async function processarTxid(txid, fromPolling = false) {
     if (txidsEmProcessamento.has(txid)) {
         return null;
     }
@@ -57,9 +57,11 @@ async function processarTxid(txid) {
     txidsEmProcessamento.add(txid);
 
     try {
-        const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
-        if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
-            return null;
+        if (!fromPolling) {
+            const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
+            if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
+                return null;
+            }
         }
 
         return await _processarTxidInterno(txid);
@@ -74,9 +76,10 @@ async function _processarTxidInterno(txid) {
             TXID: txid,
             FRMPAG: { [Op.ne]: 'BOL' },
         },
+        raw: true,
     });
     if (!pagamento) {
-        const boleto = await VPagamentosPix.findOne({ where: { TXID: txid, FRMPAG: 'BOL' } });
+        const boleto = await VPagamentosPix.findOne({ where: { TXID: txid, FRMPAG: 'BOL' }, raw: true });
         if (boleto) {
             txidsBoleto.add(txid);
             logger.info(`[Ignorado] TXID ${txid} é boleto — encontrado em V_PAGAMENTOS_PIX.`);
@@ -87,21 +90,21 @@ async function _processarTxidInterno(txid) {
         return false;
     }
 
-    const itemCarga = await FatoItensCargas.findOne({ where: { NF: pagamento.NF } });
+    const itemCarga = await FatoItensCargas.findOne({ where: { NF: pagamento.NF }, raw: true });
     if (!itemCarga) {
         txidsFalhos.set(txid, { motivo: `NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS.`);
         return false;
     }
 
-    const carga = await FatoCargas.findOne({ where: { CARGA: itemCarga.CARGA } });
+    const carga = await FatoCargas.findOne({ where: { CARGA: itemCarga.CARGA }, raw: true });
     if (!carga) {
         txidsFalhos.set(txid, { motivo: `CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS.`);
         return false;
     }
 
-    const motorista = await DimMotoristas.findOne({ where: { COD_MOTORISTA: carga.CODMOTORI } });
+    const motorista = await DimMotoristas.findOne({ where: { COD_MOTORISTA: carga.CODMOTORI }, raw: true });
     if (!motorista) {
         txidsFalhos.set(txid, { motivo: `CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS.`);
@@ -145,10 +148,11 @@ async function _processarTxidInterno(txid) {
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
 
     await enfileirarAlertaGoogleChat(mensagem);
-    const baixa = await Z16010.findOne({ where: { Z16_TXID: txid } });
-    if (baixa) {
-        baixa.Z16_STENVW = '1';
-        await baixa.save();
+    const [linhasAfetadas] = await Z16010.update(
+        { Z16_STENVW: '1' },
+        { where: { Z16_TXID: txid } }
+    );
+    if (linhasAfetadas > 0) {
         logger.info(`Z16_STENVW atualizado para '1' — TXID: ${txid}`);
     }
 
@@ -190,7 +194,8 @@ app.post('/notificar', async (req, res) => {
     }
 });
 
-const LIMITE_POLLING = 100; 
+const LIMITE_POLLING = 100;
+const CONCORRENCIA = 3;     
 
 async function pollingLoop() {
     logger.info(`[Polling] Iniciado — verificando pendentes a cada ${INTERVALO_POLLING_MS / 1000}s (lote máx: ${LIMITE_POLLING}).`);
@@ -224,13 +229,16 @@ async function pollingLoop() {
                     `[Polling] ${pendentes.length} pendente(s) na Z16010 — ` +
                     `${paraProcessar.length} novo(s) para processar.`
                 );
-                for (const baixa of paraProcessar) {
-                    try {
-                        await processarTxid(baixa.Z16_TXID);
-                    } catch (err) {
-                        logger.error(`[Polling] Erro ao processar TXID ${baixa.Z16_TXID}: ${err.message}`);
-                        await enfileirarAlertaGoogleChat(`[Polling] Erro ao processar PIX. TXID: ${baixa.Z16_TXID}: ${err.message}`);
-                    }
+                for (let i = 0; i < paraProcessar.length; i += CONCORRENCIA) {
+                    const lote = paraProcessar.slice(i, i + CONCORRENCIA);
+                    await Promise.all(lote.map(async (baixa) => {
+                        try {
+                            await processarTxid(baixa.Z16_TXID, true);
+                        } catch (err) {
+                            logger.error(`[Polling] Erro ao processar TXID ${baixa.Z16_TXID}: ${err.message}`);
+                            await enfileirarAlertaGoogleChat(`[Polling] Erro ao processar PIX. TXID: ${baixa.Z16_TXID}: ${err.message}`);
+                        }
+                    }));
                 }
             }
         } catch (err) {
