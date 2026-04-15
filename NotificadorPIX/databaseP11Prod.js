@@ -7,6 +7,12 @@ const sequelizeP11Prod = new Sequelize('p11_prod', DB_USER, DB_PASSWORD_NERIAS, 
     host: DB_HOST,
     dialect: 'mssql',
     logging: false,
+    pool: {
+        max: 5,
+        min: 1,
+        acquire: 30000,
+        idle: 10000,
+    },
 });
 
 sequelizeP11Prod.authenticate()

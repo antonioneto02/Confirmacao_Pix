@@ -1,7 +1,6 @@
 const express = require('express');
 const { Op } = require('sequelize');
 require('dotenv').config();
-
 const logger = require('./logger');
 const Z16010 = require('./z16010');
 const VPagamentosPix = require('./vPagamentosPix');
@@ -9,17 +8,24 @@ const FatoItensCargas = require('./fatoItensCargas');
 const FatoCargas = require('./fatoCargas');
 const DimMotoristas = require('./dimMotoristas');
 const FilaNotificacoes = require('./filaNotificacoes');
-
 const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
 const INTERVALO_POLLING_MS = 30_000;
 const PORT = parseInt(process.env.PORT);
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const txidsEmProcessamento = new Set();
 const txidsPendentesPolling = new Set();
 const txidsBoleto = new Set();
-const txidsFalhos = new Map(); // txid -> motivo da falha
+const txidsFalhos = new Map(); 
+const TTL_FALHOS_MS = 60 * 60 * 1000; 
+
+function limparFalhosExpirados() {
+    const agora = Date.now();
+    for (const [txid, entry] of txidsFalhos) {
+        if (agora - entry.timestamp > TTL_FALHOS_MS) {
+            txidsFalhos.delete(txid);
+        }
+    }
+}
 
 async function enfileirarAlertaGoogleChat(mensagem) {
     try {
@@ -75,7 +81,7 @@ async function _processarTxidInterno(txid) {
             txidsBoleto.add(txid);
             logger.info(`[Ignorado] TXID ${txid} é boleto — encontrado em V_PAGAMENTOS_PIX.`);
         } else {
-            txidsFalhos.set(txid, 'sem registro em V_PAGAMENTOS_PIX');
+            txidsFalhos.set(txid, { motivo: 'sem registro em V_PAGAMENTOS_PIX', timestamp: Date.now() });
             logger.warn(`[Falho] TXID ${txid} — sem registro em V_PAGAMENTOS_PIX.`);
         }
         return false;
@@ -83,21 +89,21 @@ async function _processarTxidInterno(txid) {
 
     const itemCarga = await FatoItensCargas.findOne({ where: { NF: pagamento.NF } });
     if (!itemCarga) {
-        txidsFalhos.set(txid, `NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS`);
+        txidsFalhos.set(txid, { motivo: `NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS.`);
         return false;
     }
 
     const carga = await FatoCargas.findOne({ where: { CARGA: itemCarga.CARGA } });
     if (!carga) {
-        txidsFalhos.set(txid, `CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS`);
+        txidsFalhos.set(txid, { motivo: `CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS.`);
         return false;
     }
 
     const motorista = await DimMotoristas.findOne({ where: { COD_MOTORISTA: carga.CODMOTORI } });
     if (!motorista) {
-        txidsFalhos.set(txid, `CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS`);
+        txidsFalhos.set(txid, { motivo: `CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS`, timestamp: Date.now() });
         logger.warn(`[Falho] TXID ${txid} — CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS.`);
         return false;
     }
@@ -184,12 +190,16 @@ app.post('/notificar', async (req, res) => {
     }
 });
 
+const LIMITE_POLLING = 100; 
+
 async function pollingLoop() {
-    logger.info(`[Polling] Iniciado — verificando pendentes a cada ${INTERVALO_POLLING_MS / 1000}s.`);
+    logger.info(`[Polling] Iniciado — verificando pendentes a cada ${INTERVALO_POLLING_MS / 1000}s (lote máx: ${LIMITE_POLLING}).`);
     while (true) {
         try {
-            logger.info('[Polling] Verificando pendentes na Z16010...');
+            limparFalhosExpirados();
+
             const pendentes = await Z16010.findAll({
+                attributes: ['Z16_TXID'],
                 where: {
                     Z16_STENVW: '0',
                     Z16_TXID: {
@@ -200,21 +210,21 @@ async function pollingLoop() {
                         ],
                     },
                 },
+                limit: LIMITE_POLLING,
+                raw: true,
             });
 
             if (pendentes.length > 0) {
-                const qtdBoleto = pendentes.filter(b => txidsBoleto.has(b.Z16_TXID)).length;
-                const qtdFalhos = pendentes.filter(b => txidsFalhos.has(b.Z16_TXID)).length;
-                const qtdEmProcessamento = pendentes.filter(b => txidsEmProcessamento.has(b.Z16_TXID)).length;
-                const qtdNovos = pendentes.length - qtdBoleto - qtdFalhos - qtdEmProcessamento;
-                logger.info(
-                    `[Polling] ${pendentes.length} registro(s) pendente(s) na Z16010 — ` +
-                    `${qtdNovos} novo(s) para processar, ` +
-                    `${qtdBoleto} boleto(s) (cache), ` +
-                    `${qtdFalhos} com falha de dados (cache), ` +
-                    `${qtdEmProcessamento} em processamento.`
+                const paraProcessar = pendentes.filter(b =>
+                    !txidsBoleto.has(b.Z16_TXID) &&
+                    !txidsFalhos.has(b.Z16_TXID) &&
+                    !txidsEmProcessamento.has(b.Z16_TXID)
                 );
-                for (const baixa of pendentes) {
+                logger.info(
+                    `[Polling] ${pendentes.length} pendente(s) na Z16010 — ` +
+                    `${paraProcessar.length} novo(s) para processar.`
+                );
+                for (const baixa of paraProcessar) {
                     try {
                         await processarTxid(baixa.Z16_TXID);
                     } catch (err) {
