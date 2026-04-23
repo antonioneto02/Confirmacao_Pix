@@ -11,7 +11,6 @@ const FilaNotificacoes = require('./filaNotificacoes');
 const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
 const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
-
 // ex: '20260415'
 const POLLING_DATA_FIXA = null;
 
@@ -61,9 +60,6 @@ async function processarTxid(txid, fromPolling = false) {
     if (txidsEmProcessamento.has(txid)) {
         return null;
     }
-    if (txidsBoleto.has(txid)) {
-        return null;
-    }
     if (txidsFalhos.has(txid)) {
         return null;
     }
@@ -73,6 +69,10 @@ async function processarTxid(txid, fromPolling = false) {
         if (!fromPolling) {
             const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
             if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
+                return null;
+            }
+            if (baixaExistente && baixaExistente.Z16_TPLIQ !== 2) {
+                logger.info(`[Skip] TXID ${txid} — Z16_TPLIQ=${baixaExistente.Z16_TPLIQ}, notificação ignorada (não é PIX).`);
                 return null;
             }
         }
@@ -85,21 +85,12 @@ async function processarTxid(txid, fromPolling = false) {
 
 async function _processarTxidInterno(txid) {
     const pagamento = await VPagamentosPix.findOne({
-        where: {
-            TXID: txid,
-            FRMPAG: { [Op.ne]: 'BOL' },
-        },
+        where: { TXID: txid },
         raw: true,
     });
     if (!pagamento) {
-        const boleto = await VPagamentosPix.findOne({ where: { TXID: txid, FRMPAG: 'BOL' }, raw: true });
-        if (boleto) {
-            txidsBoleto.add(txid);
-            logger.info(`[Ignorado] TXID ${txid} é boleto — encontrado em V_PAGAMENTOS_PIX.`);
-        } else {
-            txidsFalhos.set(txid, { motivo: 'sem registro em V_PAGAMENTOS_PIX', timestamp: Date.now() });
-            logger.warn(`[Falho] TXID ${txid} — sem registro em V_PAGAMENTOS_PIX.`);
-        }
+        txidsFalhos.set(txid, { motivo: 'sem registro em V_PAGAMENTOS_PIX', timestamp: Date.now() });
+        logger.warn(`[Falho] TXID ${txid} — sem registro em V_PAGAMENTOS_PIX.`);
         return false;
     }
 
@@ -229,6 +220,7 @@ async function pollingLoop() {
                 where: {
                     Z16_STENVW: '0',
                     Z16_DTBAIX: dataPolling,
+                    Z16_TPLIQ: 2,
                     Z16_TXID: {
                         [Op.and]: [
                             { [Op.ne]: null },

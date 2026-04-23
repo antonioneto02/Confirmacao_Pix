@@ -19,6 +19,7 @@ Z16010.init({
     Z16_HRPROC: { type: DataTypes.STRING, allowNull: true },
     Z16_STENVW: { type: DataTypes.STRING, allowNull: true },
     Z16_E2EID: { type: DataTypes.STRING, allowNull: true },
+    Z16_TPLIQ: { type: DataTypes.INTEGER, allowNull: true },
 }, {
     sequelize: sequelizeP11Prod,
     modelName: 'Z16010',
