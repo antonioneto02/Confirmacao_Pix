@@ -71,7 +71,7 @@ async function processarTxid(txid, fromPolling = false) {
             if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
                 return null;
             }
-            if (baixaExistente && baixaExistente.Z16_TPLIQ !== 2) {
+            if (baixaExistente && parseInt(baixaExistente.Z16_TPLIQ) !== 2) {
                 logger.info(`[Skip] TXID ${txid} — Z16_TPLIQ=${baixaExistente.Z16_TPLIQ}, notificação ignorada (não é PIX).`);
                 return null;
             }
