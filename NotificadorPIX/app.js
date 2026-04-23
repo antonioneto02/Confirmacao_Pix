@@ -119,6 +119,11 @@ async function _processarTxidInterno(txid) {
         ? 'confirmacao_pix_template'
         : 'confirmacao_pix_bot';
 
+    const hrPagto = (() => {
+        const s = String(pagamento.HR_PAGTO || '').trim();
+        return (s.length === 4 && !s.includes(':')) ? `${s.slice(0, 2)}:${s.slice(2)}` : s;
+    })();
+
     const mensagem =
         `CONFIRMAÇÃO DE PAGAMENTO - PIX\n` +
         `Cliente: ${pagamento.CLIENTE}\n` +
@@ -126,7 +131,7 @@ async function _processarTxidInterno(txid) {
         `Data Emissão: ${pagamento.DT_EMISSAO}\n` +
         `Valor: *${pagamento.VALOR}*\n` +
         `Data Pagto: ${pagamento.DT_PAGTO}\n` +
-        `Hora Pagto: ${pagamento.HR_PAGTO}\n` +
+        `Hora Pagto: ${hrPagto}\n` +
         `TXID: ${pagamento.TXID}`;
 
     await FilaNotificacoes.create({
@@ -140,7 +145,7 @@ async function _processarTxidInterno(txid) {
             dt_emissao: pagamento.DT_EMISSAO,
             valor: String(pagamento.VALOR),
             dt_pagto: pagamento.DT_PAGTO,
-            hr_pagto: pagamento.HR_PAGTO,
+            hr_pagto: hrPagto,
             txid,
         }),
         STATUS: 'PENDENTE',
