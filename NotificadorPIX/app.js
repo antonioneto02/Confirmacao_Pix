@@ -1,4 +1,7 @@
 const express = require('express');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { Op } = require('sequelize');
 require('dotenv').config();
 const logger = require('./logger');
@@ -270,7 +273,13 @@ async function pollingLoop() {
     }
 }
 
-app.listen(PORT, () => {
-    logger.info(`NotificadorPIX API ouvindo na porta ${PORT}`);
+const CERT_DIR = 'C:\\Projetos\\Certificados';
+const sslOptions = {
+    key: fs.readFileSync(path.join(CERT_DIR, 'cini.key')),
+    cert: fs.readFileSync(path.join(CERT_DIR, 'cini.crt')),
+};
+
+https.createServer(sslOptions, app).listen(PORT, () => {
+    logger.info(`NotificadorPIX API ouvindo na porta ${PORT} (https)`);
     pollingLoop();
 });
