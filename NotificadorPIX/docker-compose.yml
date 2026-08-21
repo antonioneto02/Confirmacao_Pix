@@ -13,5 +13,4 @@ services:
     environment:
       CERT_DIR: C:/certs
     volumes:
-      - ./logs:C:/app/logs
       - C:/Projetos/Certificados:C:/certs:ro
