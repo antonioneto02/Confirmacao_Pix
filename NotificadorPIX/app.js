@@ -176,6 +176,11 @@ const { swaggerUi, swaggerDocument } = require('./swagger');
 const app = express();
 app.use(express.json());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', service: 'notificador-pix' });
+});
+
 app.post('/notificar', async (req, res) => {
     const { txid } = req.body;
     if (!txid) {
@@ -273,7 +278,7 @@ async function pollingLoop() {
     }
 }
 
-const CERT_DIR = 'C:\\Projetos\\Certificados';
+const CERT_DIR = process.env.CERT_DIR || 'C:\\Projetos\\Certificados';
 const sslOptions = {
     key: fs.readFileSync(path.join(CERT_DIR, 'cini.key')),
     cert: fs.readFileSync(path.join(CERT_DIR, 'cini.crt')),

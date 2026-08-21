@@ -6,6 +6,11 @@ const { DB_HOST, DB_USER, DB_PASSWORD_NERIAS } = process.env;
 const sequelizeDW = new Sequelize('dw', DB_USER, DB_PASSWORD_NERIAS, {
     host: DB_HOST,
     dialect: 'mssql',
+    dialectOptions: {
+        options: {
+            connectTimeout: 5000,
+        },
+    },
     logging: false,
     pool: {
         max: 5,

@@ -1,0 +1,17 @@
+services:
+  notificador-pix:
+    image: notificador-pix:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notificador-pix
+    restart: unless-stopped
+    ports:
+      - "3013:3013"
+    env_file:
+      - .env
+    environment:
+      CERT_DIR: C:/certs
+    volumes:
+      - ./logs:C:/app/logs
+      - C:/Projetos/Certificados:C:/certs:ro

@@ -1,0 +1,235 @@
+name: CI/CD - Notificador PIX
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  APP_PORT: 3013
+  PM2_APP_NAME: notificador-pix
+  DEPLOY_PATH: C:/Projetos/Confirmacao_Pix/NotificadorPIX
+
+jobs:
+  build-and-test:
+    name: Build e Testes
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: NotificadorPIX
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Baixar código-fonte
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+          cache-dependency-path: NotificadorPIX/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Verificar sintaxe
+        run: find . -name '*.js' -not -path './node_modules/*' -not -name '*.test.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Auditoria de dependências
+        run: npx --yes audit-ci@7 --high
+
+      - name: SAST (segurança com ESLint)
+        run: npx eslint .
+
+      - name: Testes unitários
+        run: npm run test:unit
+
+      - name: Varredura de segredos
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Teste de fumaça (boot)
+        run: |
+          CERT_DIR="$RUNNER_TEMP/certs"
+          mkdir -p "$CERT_DIR"
+          openssl req -x509 -newkey rsa:2048 -keyout "$CERT_DIR/cini.key" -out "$CERT_DIR/cini.crt" \
+            -days 1 -nodes -subj '/CN=localhost' 2>/dev/null
+
+          CERT_DIR="$CERT_DIR" PORT=${{ env.APP_PORT }} DB_HOST=127.0.0.1 DB_USER=ci DB_PASSWORD_NERIAS=ci node app.js &
+          APP_PID=$!
+          READY=0
+          for i in $(seq 1 20); do
+            if curl -fsSk "https://127.0.0.1:${{ env.APP_PORT }}/health"; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          kill "$APP_PID" 2>/dev/null || true
+          rm -rf "$CERT_DIR"
+          if [ "$READY" -ne 1 ]; then
+            echo "Servidor não respondeu 200 em /health a tempo"
+            exit 1
+          fi
+
+  deploy:
+    name: Implantar em Produção
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.DEPLOY_FROZEN != 'true'
+    runs-on: [self-hosted, windows, cini-prod]
+    environment: production
+    concurrency:
+      group: deploy-notificador-pix
+      cancel-in-progress: false
+    steps:
+      - name: Aguardar lock de deploy (evita 2 deploys ao mesmo tempo na máquina)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lockFile = "C:\actions-runner\.deploy.lock"
+          $maxAgeMinutes = 15
+          $maxWaitMinutes = 20
+          $waitedSeconds = 0
+          while (Test-Path $lockFile) {
+            $age = (Get-Date) - (Get-Item $lockFile).LastWriteTime
+            if ($age.TotalMinutes -gt $maxAgeMinutes) {
+              Write-Output "Lock parece obsoleto (mais de $maxAgeMinutes min) -- destravando."
+              Remove-Item $lockFile -Force
+              break
+            }
+            Write-Output "Outro deploy em andamento nesse servidor, aguardando... ($([math]::Round($waitedSeconds/60,1)) min esperados)"
+            Start-Sleep -Seconds 15
+            $waitedSeconds += 15
+            if ($waitedSeconds -ge ($maxWaitMinutes * 60)) {
+              throw "Timeout esperando o lock de deploy ser liberado (${maxWaitMinutes}min)."
+            }
+          }
+          "${{ github.repository }} / run ${{ github.run_id }} / $(Get-Date -Format o)" | Set-Content -Path $lockFile
+
+      - name: Atualizar diretório de trabalho
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location "C:/Projetos/Confirmacao_Pix"
+          $prevSha = git rev-parse HEAD
+          Write-Output "Previous commit: $prevSha"
+          Add-Content -Path $env:GITHUB_ENV -Value "PREV_SHA=$prevSha"
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Verificar bind mounts do host
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          $config = docker compose config --format json | ConvertFrom-Json
+          $missing = @()
+          foreach ($svc in $config.services.PSObject.Properties) {
+            foreach ($vol in $svc.Value.volumes) {
+              if ($vol.type -eq 'bind' -and $vol.source -and -not (Test-Path -LiteralPath $vol.source)) {
+                $missing += $vol.source
+              }
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output "Bind mount(s) inexistente(s) no host: $($missing -join ', ')"
+            throw "Deploy abortado antes de qualquer alteração: caminho de bind mount não existe no host. Corrija o caminho (ou crie a pasta) e rode o deploy de novo."
+          }
+          Write-Output "Todos os bind mounts existem no host."
+
+      - name: Build da imagem Docker
+        shell: powershell
+        run: |
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          docker build -t notificador-pix:${{ github.sha }} -t notificador-pix:latest .
+
+      - name: Verificar imagem com Trivy
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trivyDir = "C:\actions-runner\trivy-cache"
+          if (-not (Test-Path "$trivyDir\trivy.exe")) {
+            New-Item -ItemType Directory -Force -Path $trivyDir | Out-Null
+            Invoke-WebRequest -Uri "https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_windows-64bit.zip" -OutFile "$trivyDir\trivy.zip"
+            Expand-Archive -Path "$trivyDir\trivy.zip" -DestinationPath $trivyDir -Force
+          }
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          & "$trivyDir\trivy.exe" image --scanners vuln --cache-dir "$trivyDir\cache" --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed "notificador-pix:${{ github.sha }}"
+
+      - name: Implantar (docker compose + verificação de saúde + rollback)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          $prevSha = $env:PREV_SHA
+          Write-Output "Rollback target if health check fails: $prevSha"
+
+          try { pm2 delete "${{ env.PM2_APP_NAME }}" 2>&1 | Out-Null } catch {}
+
+          docker compose up -d --force-recreate
+
+          $healthy = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            $code = & curl.exe -sk -o NUL -w "%{http_code}" "https://127.0.0.1:${{ env.APP_PORT }}/health" 2>$null
+            if ($code -eq "200") { $healthy = $true; break }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $healthy) {
+            Write-Output "Health check failed after deploy. Rolling back to $prevSha"
+            docker compose logs --tail=100
+            git reset --hard $prevSha
+            docker build -t notificador-pix:$prevSha -t notificador-pix:latest .
+            docker compose up -d --force-recreate
+            throw "Deploy failed health check; rolled back to $prevSha"
+          }
+
+          Write-Output "Deploy successful. Now running: $(git rev-parse HEAD)"
+
+      - name: Notificar sucesso
+        if: success()
+        shell: powershell
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $check = [char]0x2705
+          $bt = [char]96
+          $sha = git -C "C:/Projetos/Confirmacao_Pix" rev-parse --short HEAD
+          $msg = git -C "C:/Projetos/Confirmacao_Pix" log -1 --pretty=%s
+          $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $commitUrl = "${{ github.server_url }}/${{ github.repository }}/commit/$sha"
+          $actor = "${{ github.actor }}"
+          $text = "$check *notificador-pix* - deploy concluido com sucesso`nCommit: $bt$sha$bt - $msg`nDisparado por: $actor`n<$runUrl|Ver execucao> | <$commitUrl|Ver commit>"
+          $body = @{ text = $text } | ConvertTo-Json
+          $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+          Invoke-RestMethod -Uri "${{ secrets.DEPLOY_WEBHOOK_URL }}" -Method Post -Body $bodyBytes -ContentType 'application/json; charset=utf-8'
+
+      - name: Notificar falha
+        if: failure()
+        shell: powershell
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $cross = [char]0x274C
+          $bt = [char]96
+          $sha = git -C "C:/Projetos/Confirmacao_Pix" rev-parse --short HEAD
+          $msg = git -C "C:/Projetos/Confirmacao_Pix" log -1 --pretty=%s
+          $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $commitUrl = "${{ github.server_url }}/${{ github.repository }}/commit/$sha"
+          $actor = "${{ github.actor }}"
+          $text = "$cross *notificador-pix* - deploy FALHOU (rollback automatico executado)`nCommit tentado: $bt$sha$bt - $msg`nDisparado por: $actor`n<$runUrl|Ver execucao (logs)> | <$commitUrl|Ver commit>"
+          $body = @{ text = $text } | ConvertTo-Json
+          $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+          Invoke-RestMethod -Uri "${{ secrets.DEPLOY_WEBHOOK_URL }}" -Method Post -Body $bodyBytes -ContentType 'application/json; charset=utf-8'
+
+      - name: Liberar lock de deploy
+        if: always()
+        shell: powershell
+        run: |
+          $lockFile = "C:\actions-runner\.deploy.lock"
+          if (Test-Path $lockFile) { Remove-Item $lockFile -Force }
