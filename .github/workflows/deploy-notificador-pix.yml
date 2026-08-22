@@ -173,6 +173,20 @@ jobs:
 
           try { pm2 delete "${{ env.PM2_APP_NAME }}" 2>&1 | Out-Null } catch {}
 
+          # Apos reboot do host, o Windows/HNS as vezes recria a rede do
+          # projeto sem o label do compose (sobra de containers antigos) --
+          # isso faz o "docker compose up" demorar demais e estourar o
+          # timeout do healthcheck abaixo. Remove a rede orfa antes, se houver.
+          try {
+            $projectName = (Split-Path -Leaf (Get-Location)).ToLower()
+            $netName = "${projectName}_default"
+            $netLabel = docker network inspect $netName --format '{{index .Labels "com.docker.compose.network"}}' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $netLabel -ne "default") {
+              Write-Output "Rede '$netName' orfa (sem label do compose) -- removendo antes do deploy."
+              docker network rm $netName 2>&1 | Out-Null
+            }
+          } catch {}
+
           docker compose up -d --force-recreate
 
           $healthy = $false
