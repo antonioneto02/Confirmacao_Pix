@@ -13,4 +13,7 @@ services:
     environment:
       CERT_DIR: C:/certs
     volumes:
+      # Pasta inteira (nao so o codigo copiado na imagem): restart via
+      # supervisor pega o que estiver salvo no disco na hora, sem rebuild.
+      - C:/Projetos/Confirmacao_Pix/NotificadorPIX:C:/app
       - C:/Projetos/Certificados:C:/certs:ro

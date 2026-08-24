@@ -16,4 +16,4 @@ RUN Remove-Item -Recurse -Force 'C:\nodejs\node_modules\npm', 'C:\nodejs\node_mo
     Remove-Item -Force 'C:\nodejs\npm', 'C:\nodejs\npm.cmd', 'C:\nodejs\npm.ps1', 'C:\nodejs\npx', 'C:\nodejs\npx.cmd', 'C:\nodejs\npx.ps1', 'C:\nodejs\corepack', 'C:\nodejs\corepack.cmd' -ErrorAction SilentlyContinue
 COPY . .
 EXPOSE 3013
-CMD ["C:\\nodejs\\node.exe", "app.js"]
+CMD ["C:\\nodejs\\node.exe", "supervisor.js"]
