@@ -11,6 +11,9 @@ env:
   APP_PORT: 3013
   PM2_APP_NAME: notificador-pix
   DEPLOY_PATH: C:/Projetos/Confirmacao_Pix/NotificadorPIX
+  # Comando pra disparar o supervisor de dentro do container (restart
+  # interno, sem docker compose) -- varia por runtime da app.
+  SUPERVISOR_TRIGGER_CMD: node supervisor-trigger.js
 
 jobs:
   build-and-test:
@@ -124,6 +127,30 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
+      - name: Detectar se precisa reconstruir a imagem
+        # A pasta inteira ja e montada ao vivo no container (nao so a copia
+        # da imagem) -- pra um deploy que so mudou codigo, "git reset --hard"
+        # acima ja e suficiente pro container enxergar o novo codigo; so
+        # falta reiniciar o processo interno via supervisor (~0.5s, nunca
+        # toca em docker compose/HCS). So precisa reconstruir a imagem de
+        # verdade quando Dockerfile ou dependencias mudaram.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location "${{ env.DEPLOY_PATH }}"
+          $prevSha = $env:PREV_SHA
+          $changed = git diff --name-only $prevSha HEAD
+          Write-Output "Arquivos alterados:`n$changed"
+          $needsRebuild = $false
+          foreach ($f in $changed) {
+            if ($f -match '^(Dockerfile|package\.json|package-lock\.json|requirements\.txt)$') {
+              $needsRebuild = $true
+              break
+            }
+          }
+          Write-Output "Precisa reconstruir imagem: $needsRebuild"
+          Add-Content -Path $env:GITHUB_ENV -Value "NEEDS_REBUILD=$needsRebuild"
+
       - name: Verificar bind mounts do host
         shell: powershell
         run: |
@@ -145,6 +172,7 @@ jobs:
           Write-Output "Todos os bind mounts existem no host."
 
       - name: Build da imagem Docker
+        if: env.NEEDS_REBUILD == 'True'
         shell: powershell
         run: |
           Set-Location "${{ env.DEPLOY_PATH }}"
@@ -167,34 +195,49 @@ jobs:
           Set-Location "${{ env.DEPLOY_PATH }}"
           & "$trivyDir\trivy.exe" image --scanners vuln --cache-dir "$trivyDir\cache" --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed "notificador-pix:${{ github.sha }}"
 
-      - name: Implantar (docker compose + verificação de saúde + rollback)
+      - name: Implantar (restart via supervisor, ou docker compose se precisou rebuild)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           Set-Location "${{ env.DEPLOY_PATH }}"
           $prevSha = $env:PREV_SHA
+          $needsRebuild = $env:NEEDS_REBUILD -eq "True"
           Write-Output "Rollback target if health check fails: $prevSha"
+          Write-Output "Caminho: $(if ($needsRebuild) { 'rebuild completo' } else { 'restart interno via supervisor' })"
 
-          try { pm2 delete "${{ env.PM2_APP_NAME }}" 2>&1 | Out-Null } catch {}
+          function Recreate-Container {
 
-          # Apos reboot do host, o Windows/HNS as vezes recria a rede do
-          # projeto sem o label do compose (sobra de containers antigos) --
-          # isso faz o "docker compose up" demorar demais e estourar o
-          # timeout do healthcheck abaixo. Remove a rede orfa antes, se houver.
-          try {
-            $projectName = (Split-Path -Leaf (Get-Location)).ToLower()
-            $netName = "${projectName}_default"
-            $netJson = docker network inspect $netName --format '{{json .Labels}}' 2>$null
-            if ($LASTEXITCODE -eq 0) {
-              $netLabels = $netJson | ConvertFrom-Json
-              if ($netLabels.'com.docker.compose.network' -ne 'default') {
-                Write-Output "Rede '$netName' orfa (sem label do compose) -- removendo antes do deploy."
-                docker network rm $netName 2>&1 | Out-Null
+            try { pm2 delete "${{ env.PM2_APP_NAME }}" 2>&1 | Out-Null } catch {}
+
+            # Apos reboot do host, o Windows/HNS as vezes recria a rede do
+            # projeto sem o label do compose (sobra de containers antigos) --
+            # isso faz o "docker compose up" demorar demais e estourar o
+            # timeout do healthcheck abaixo. Remove a rede orfa antes, se houver.
+            try {
+              $projectName = (Split-Path -Leaf (Get-Location)).ToLower()
+              $netName = "${projectName}_default"
+              $netJson = docker network inspect $netName --format '{{json .Labels}}' 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $netLabels = $netJson | ConvertFrom-Json
+                if ($netLabels.'com.docker.compose.network' -ne 'default') {
+                  Write-Output "Rede '$netName' orfa (sem label do compose) -- removendo antes do deploy."
+                  docker network rm $netName 2>&1 | Out-Null
+                }
               }
-            }
-          } catch {}
+            } catch {}
 
-          docker compose up -d --force-recreate
+            docker compose up -d --force-recreate
+          }
+
+          if ($needsRebuild) {
+            Recreate-Container
+          } else {
+            # Caminho rapido: o "git reset --hard" ja atualizou o disco, que
+            # o container ve ao vivo (mount da pasta inteira) -- so falta
+            # reiniciar o processo interno via supervisor, nunca toca em
+            # docker compose/HCS.
+            docker exec "${{ env.PM2_APP_NAME }}" $env:SUPERVISOR_TRIGGER_CMD.Split(' ')
+          }
 
           $healthy = $false
           for ($i = 0; $i -lt 20; $i++) {
@@ -207,19 +250,12 @@ jobs:
             Write-Output "Health check failed after deploy. Rolling back to $prevSha"
             docker compose logs --tail=100
             git reset --hard $prevSha
+          if ($needsRebuild) {
             docker build -t notificador-pix:$prevSha -t notificador-pix:latest .
-            try {
-              $projectName = (Split-Path -Leaf (Get-Location)).ToLower()
-              $netName = "${projectName}_default"
-              $netJson = docker network inspect $netName --format '{{json .Labels}}' 2>$null
-              if ($LASTEXITCODE -eq 0) {
-                $netLabels = $netJson | ConvertFrom-Json
-                if ($netLabels.'com.docker.compose.network' -ne 'default') {
-                  docker network rm $netName 2>&1 | Out-Null
-                }
-              }
-            } catch {}
-            docker compose up -d --force-recreate
+            Recreate-Container
+          } else {
+            docker exec "${{ env.PM2_APP_NAME }}" $env:SUPERVISOR_TRIGGER_CMD.Split(' ')
+          }
             throw "Deploy failed health check; rolled back to $prevSha"
           }
 
