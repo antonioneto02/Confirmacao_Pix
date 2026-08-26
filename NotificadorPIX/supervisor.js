@@ -57,4 +57,11 @@ server.listen(TRIGGER_PORT, '127.0.0.1', () => {
 process.on('SIGINT', () => { if (child) child.kill(); process.exit(0); });
 process.on('SIGBREAK', () => { if (child) child.kill(); process.exit(0); });
 
-startChild();
+// So sobe o filho e o servidor de trigger quando executado direto (node
+// supervisor.js) -- se algum teste do app fizer require() de todo .js da
+// pasta (padrao comum pra pegar erro de sintaxe), isso evita tentar
+// spawnar C:\nodejs\node.exe (so existe no host de producao) durante o
+// import, o que quebrava o teste no runner Linux do CI.
+if (require.main === module) {
+  startChild();
+}
