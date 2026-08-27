@@ -86,35 +86,48 @@ async function processarTxid(txid, fromPolling = false) {
     }
 }
 
+async function registrarFalha(txid, motivo, dados = {}) {
+    txidsFalhos.set(txid, { motivo, timestamp: Date.now() });
+    logger.warn(`[Falho] TXID ${txid} — ${motivo}.`);
+
+    const linhas = [
+        `PIX RECEBIDO SEM CONFIRMAÇÃO AUTOMÁTICA`,
+        `TXID: ${txid}`,
+        `Motivo: ${motivo}`,
+    ];
+    if (dados.nf) linhas.push(`NF: ${dados.nf}`);
+    if (dados.carga) linhas.push(`Carga: ${dados.carga}`);
+    if (dados.valor !== undefined && dados.valor !== null) linhas.push(`Valor: ${dados.valor}`);
+    linhas.push(`Verifique manualmente na Z16010 — não será enviada confirmação ao motorista.`);
+
+    await enfileirarAlertaGoogleChat(linhas.join('\n'));
+}
+
 async function _processarTxidInterno(txid) {
     const pagamento = await VPagamentosPix.findOne({
         where: { TXID: txid },
         raw: true,
     });
     if (!pagamento) {
-        txidsFalhos.set(txid, { motivo: 'sem registro em V_PAGAMENTOS_PIX', timestamp: Date.now() });
-        logger.warn(`[Falho] TXID ${txid} — sem registro em V_PAGAMENTOS_PIX.`);
+        await registrarFalha(txid, 'sem registro em V_PAGAMENTOS_PIX');
         return false;
     }
 
     const itemCarga = await FatoItensCargas.findOne({ where: { NF: pagamento.NF }, raw: true });
     if (!itemCarga) {
-        txidsFalhos.set(txid, { motivo: `NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS`, timestamp: Date.now() });
-        logger.warn(`[Falho] TXID ${txid} — NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS.`);
+        await registrarFalha(txid, `NF ${pagamento.NF} não encontrada em FATO_ITENS_CARGAS`, { nf: pagamento.NF, valor: pagamento.VALOR });
         return false;
     }
 
     const carga = await FatoCargas.findOne({ where: { CARGA: itemCarga.CARGA }, raw: true });
     if (!carga) {
-        txidsFalhos.set(txid, { motivo: `CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS`, timestamp: Date.now() });
-        logger.warn(`[Falho] TXID ${txid} — CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS.`);
+        await registrarFalha(txid, `CARGA ${itemCarga.CARGA} não encontrada em FATO_CARGAS`, { nf: pagamento.NF, carga: itemCarga.CARGA, valor: pagamento.VALOR });
         return false;
     }
 
     const motorista = await DimMotoristas.findOne({ where: { COD_MOTORISTA: carga.CODMOTORI }, raw: true });
     if (!motorista) {
-        txidsFalhos.set(txid, { motivo: `CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS`, timestamp: Date.now() });
-        logger.warn(`[Falho] TXID ${txid} — CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS.`);
+        await registrarFalha(txid, `CODMOTORI "${carga.CODMOTORI}" não encontrado em DIM_MOTORISTAS`, { nf: pagamento.NF, carga: itemCarga.CARGA, valor: pagamento.VALOR });
         return false;
     }
 
