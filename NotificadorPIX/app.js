@@ -100,9 +100,19 @@ function registrarFalha(txid, motivo) {
 }
 
 function montarTelefoneCliente(ddd, tel) {
-    const limpo = (String(ddd || '') + String(tel || '')).replace(/\D/g, '');
-    if (limpo.length < 10) return null;
-    return limpo.startsWith('55') ? limpo : `55${limpo}`;
+    const dddLimpo = String(ddd || '').replace(/\D/g, '');
+    const telLimpo = String(tel || '').replace(/\D/g, '');
+    if (!telLimpo) return null;
+
+    // Em alguns cadastros o TEL já vem com o DDD embutido (ex.: DDD=41,
+    // TEL=41987042945) — concatenar o DDD de novo nesse caso gerava um número
+    // com dígitos a mais (inválido), e o bot ficava tentando várias formas de
+    // resolver esse número quebrado, chegando a mandar a mensagem mais de uma vez.
+    const telJaTemDDD = dddLimpo && telLimpo.startsWith(dddLimpo) && [10, 11].includes(telLimpo.length);
+    const numeroLocal = telJaTemDDD ? telLimpo : (dddLimpo + telLimpo);
+
+    if (numeroLocal.length < 10) return null;
+    return numeroLocal.startsWith('55') ? numeroLocal : `55${numeroLocal}`;
 }
 
 // Gera as variantes "com o 9" e "sem o 9" de um número (DDI+DDD+número) pra
@@ -217,7 +227,17 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
 
         // Junta os dois números possíveis sem duplicar quando forem o mesmo
         // (considerando a variação do 9, não só string igual).
-        const telefones = juntarTelefonesSemDuplicar(telefoneDB, telefoneManual);
+        const candidatos = juntarTelefonesSemDuplicar(telefoneDB, telefoneManual);
+        // Rede de segurança contra outras inconsistências de cadastro (DDI+DDD+número
+        // válido tem 12 ou 13 dígitos) — número fora disso é rejeitado em vez de
+        // mandado, pra não repetir o problema do DDD embutido em dobro no TEL.
+        const telefones = candidatos.filter(tel => {
+            const valido = [12, 13].includes(tel.length);
+            if (!valido) {
+                logger.warn(`[Cliente] Telefone "${tel}" com formato inválido (NF ${pagamento.NF}) — não enviando pra evitar duplicidade/erro.`);
+            }
+            return valido;
+        });
         if (telefones.length === 0) {
             logger.info(`[Cliente] Nenhum telefone encontrado (nem cadastro, nem fluxo manual) pra NF ${pagamento.NF} — não é possível notificar o cliente.`);
             return;
