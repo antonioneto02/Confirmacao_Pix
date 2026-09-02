@@ -105,18 +105,84 @@ function montarTelefoneCliente(ddd, tel) {
     return limpo.startsWith('55') ? limpo : `55${limpo}`;
 }
 
+async function buscarTelefonePixManual(nf) {
+    try {
+        // No fluxo manual (motorista pede um QR/copia-e-cola pelo bot pra mandar pro
+        // cliente — ver WhatsAppWebNode/enviarMensagensPixPara), o número usado nem
+        // sempre é o mesmo cadastrado em DIM_CLIENTES (pode ser outro contato da
+        // pessoa que realmente vai pagar). Isso fica registrado na própria fila com
+        // METADADOS.tipo='pix_automatico' — usamos o registro mais recente pra essa NF.
+        const registro = await FilaNotificacoes.findOne({
+            where: {
+                TIPO_MENSAGEM: 'texto',
+                METADADOS: { [Op.like]: `%"tipo":"pix_automatico"%"nf":"${nf}"%` },
+            },
+            order: [['DTINC', 'DESC']],
+            raw: true,
+        });
+        return registro ? registro.DESTINATARIO : null;
+    } catch (err) {
+        logger.error(`[Cliente] Erro ao buscar telefone do fluxo manual de PIX (NF ${nf}): ${err.message}`);
+        return null;
+    }
+}
+
+async function enviarParConfirmacaoCliente(telefone, mensagemConfirmacao, mensagemPadrao, metadadosBase) {
+    const tarefaConfirmacao = await FilaNotificacoes.create({
+        TIPO_MENSAGEM: 'texto',
+        DESTINATARIO: telefone,
+        MENSAGEM: mensagemConfirmacao,
+        STATUS: 'PENDENTE',
+        TENTATIVAS: 0,
+        METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
+    });
+
+    // Espera a confirmação de pagamento REALMENTE sair antes de enfileirar o
+    // aviso padrão — um delay fixo não bastava: quando o primeiro envio
+    // precisava de retentativa (acontece, o bot às vezes demora/falha), o
+    // aviso padrão (que costuma dar certo de primeira) furava a fila e chegava
+    // antes. Aqui checamos o status de verdade, com um teto de segurança pra
+    // não travar o processamento do TXID indefinidamente se algo travar.
+    const ESPERA_MAX_MS = 3 * 60 * 1000;
+    const INTERVALO_CHECAGEM_MS = 3000;
+    const inicioEspera = Date.now();
+    let statusFinal = null;
+    while (Date.now() - inicioEspera < ESPERA_MAX_MS) {
+        await sleep(INTERVALO_CHECAGEM_MS);
+        const atual = await FilaNotificacoes.findOne({ where: { ID: tarefaConfirmacao.ID }, raw: true });
+        if (!atual) break;
+        if (['ENVIADA', 'FALHA', 'FALHA_DEFINITIVA'].includes(atual.STATUS)) {
+            statusFinal = atual.STATUS;
+            break;
+        }
+    }
+    if (statusFinal !== 'ENVIADA') {
+        logger.warn(`[Cliente] Confirmação de pagamento (ID ${tarefaConfirmacao.ID}, ${telefone}) não confirmou ENVIADA a tempo (status: ${statusFinal || 'ainda processando'}) — enfileirando aviso padrão mesmo assim.`);
+    }
+
+    await FilaNotificacoes.create({
+        TIPO_MENSAGEM: 'texto',
+        DESTINATARIO: telefone,
+        MENSAGEM: mensagemPadrao,
+        STATUS: 'PENDENTE',
+        TENTATIVAS: 0,
+        METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'aviso_padrao_cliente' }),
+    });
+}
+
 async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
     try {
         const documentoInfo = await FatoDocumentosSaidaCapa.findOne({ where: { NF: pagamento.NF }, raw: true });
-        if (!documentoInfo || !documentoInfo.COD_PESSOA) {
-            logger.info(`[Cliente] NF ${pagamento.NF} sem COD_PESSOA em FATO_DOCUMENTOS_SAIDA_CAPA — não é possível notificar o cliente.`);
-            return;
-        }
+        const cliente = documentoInfo && documentoInfo.COD_PESSOA
+            ? await DimClientes.findOne({ where: { COD_CLIENTE: documentoInfo.COD_PESSOA }, raw: true })
+            : null;
+        const telefoneDB = cliente && montarTelefoneCliente(cliente.DDD, cliente.TEL);
+        const telefoneManual = await buscarTelefonePixManual(pagamento.NF);
 
-        const cliente = await DimClientes.findOne({ where: { COD_CLIENTE: documentoInfo.COD_PESSOA }, raw: true });
-        const telefoneCliente = cliente && montarTelefoneCliente(cliente.DDD, cliente.TEL);
-        if (!telefoneCliente) {
-            logger.info(`[Cliente] Telefone não encontrado/inválido para COD_PESSOA ${documentoInfo.COD_PESSOA} (NF ${pagamento.NF}) — não é possível notificar o cliente.`);
+        // Junta os dois números possíveis sem duplicar quando forem o mesmo.
+        const telefones = [...new Set([telefoneDB, telefoneManual].filter(Boolean))];
+        if (telefones.length === 0) {
+            logger.info(`[Cliente] Nenhum telefone encontrado (nem cadastro, nem fluxo manual) pra NF ${pagamento.NF} — não é possível notificar o cliente.`);
             return;
         }
 
@@ -135,49 +201,12 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             `👋 Olá! Você entrou em contato com o número que fornece mensagens operacionais da CINI BEBIDAS.\n` +
             `Não monitoramos mensagens recebidas neste canal.\n` +
             `Para mais informações, entre em contato com o número: ${NUMERO_CONTATO_CINI}`;
-
         const metadadosBase = { nf: pagamento.NF, txid: pagamento.TXID, origem: 'NotificadorPIX-cliente' };
-        const tarefaConfirmacao = await FilaNotificacoes.create({
-            TIPO_MENSAGEM: 'texto',
-            DESTINATARIO: telefoneCliente,
-            MENSAGEM: mensagemConfirmacao,
-            STATUS: 'PENDENTE',
-            TENTATIVAS: 0,
-            METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
-        });
 
-        // Espera a confirmação de pagamento REALMENTE sair antes de enfileirar o
-        // aviso padrão — um delay fixo não bastava: quando o primeiro envio
-        // precisava de retentativa (acontece, o bot às vezes demora/falha), o
-        // aviso padrão (que costuma dar certo de primeira) furava a fila e chegava
-        // antes. Aqui checamos o status de verdade, com um teto de segurança pra
-        // não travar o processamento do TXID indefinidamente se algo travar.
-        const ESPERA_MAX_MS = 3 * 60 * 1000;
-        const INTERVALO_CHECAGEM_MS = 3000;
-        const inicioEspera = Date.now();
-        let statusFinal = null;
-        while (Date.now() - inicioEspera < ESPERA_MAX_MS) {
-            await sleep(INTERVALO_CHECAGEM_MS);
-            const atual = await FilaNotificacoes.findOne({ where: { ID: tarefaConfirmacao.ID }, raw: true });
-            if (!atual) break;
-            if (['ENVIADA', 'FALHA', 'FALHA_DEFINITIVA'].includes(atual.STATUS)) {
-                statusFinal = atual.STATUS;
-                break;
-            }
-        }
-        if (statusFinal !== 'ENVIADA') {
-            logger.warn(`[Cliente] Confirmação de pagamento (ID ${tarefaConfirmacao.ID}) não confirmou ENVIADA a tempo (status: ${statusFinal || 'ainda processando'}) — enfileirando aviso padrão mesmo assim.`);
-        }
-
-        await FilaNotificacoes.create({
-            TIPO_MENSAGEM: 'texto',
-            DESTINATARIO: telefoneCliente,
-            MENSAGEM: mensagemPadrao,
-            STATUS: 'PENDENTE',
-            TENTATIVAS: 0,
-            METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'aviso_padrao_cliente' }),
-        });
-        logger.info(`[Cliente] Confirmação de pagamento enfileirada para ${telefoneCliente} — NF ${pagamento.NF}, TXID: ${pagamento.TXID}`);
+        await Promise.all(telefones.map(telefone =>
+            enviarParConfirmacaoCliente(telefone, mensagemConfirmacao, mensagemPadrao, metadadosBase)
+        ));
+        logger.info(`[Cliente] Confirmação de pagamento enfileirada para ${telefones.join(', ')} — NF ${pagamento.NF}, TXID: ${pagamento.TXID}`);
     } catch (err) {
         logger.error(`[Cliente] Erro ao enfileirar confirmação para o cliente (NF ${pagamento.NF}, TXID: ${pagamento.TXID}): ${err.message}`);
     }
