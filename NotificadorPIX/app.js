@@ -10,7 +10,10 @@ const VPagamentosPix = require('./vPagamentosPix');
 const FatoItensCargas = require('./fatoItensCargas');
 const FatoCargas = require('./fatoCargas');
 const DimMotoristas = require('./dimMotoristas');
+const FatoDocumentosSaidaCapa = require('./fatoDocumentosSaidaCapa');
+const DimClientes = require('./dimClientes');
 const FilaNotificacoes = require('./filaNotificacoes');
+const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
 const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
 const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
@@ -96,6 +99,60 @@ function registrarFalha(txid, motivo) {
     logger.warn(`[Falho] TXID ${txid} — ${motivo}.`);
 }
 
+function montarTelefoneCliente(ddd, tel) {
+    const limpo = (String(ddd || '') + String(tel || '')).replace(/\D/g, '');
+    if (limpo.length < 10) return null;
+    return limpo.startsWith('55') ? limpo : `55${limpo}`;
+}
+
+async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
+    try {
+        const documentoInfo = await FatoDocumentosSaidaCapa.findOne({ where: { NF: pagamento.NF }, raw: true });
+        if (!documentoInfo || !documentoInfo.COD_PESSOA) {
+            logger.info(`[Cliente] NF ${pagamento.NF} sem COD_PESSOA em FATO_DOCUMENTOS_SAIDA_CAPA — não é possível notificar o cliente.`);
+            return;
+        }
+
+        const cliente = await DimClientes.findOne({ where: { COD_CLIENTE: documentoInfo.COD_PESSOA }, raw: true });
+        const telefoneCliente = cliente && montarTelefoneCliente(cliente.DDD, cliente.TEL);
+        if (!telefoneCliente) {
+            logger.info(`[Cliente] Telefone não encontrado/inválido para COD_PESSOA ${documentoInfo.COD_PESSOA} (NF ${pagamento.NF}) — não é possível notificar o cliente.`);
+            return;
+        }
+
+        const valorFormatado = Number(pagamento.VALOR || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const mensagemConfirmacao =
+            `🎉 Olá! Recebemos aqui na *Cini Bebidas* o seu pagamento via PIX no valor de *R$ ${valorFormatado}*!\n\n` +
+            `✅ Pagamento confirmado, muito obrigado! 😊\n` +
+            `🚚 Aguarde, seu pedido já está sendo cuidado por aqui.`;
+        const mensagemPadrao =
+            `👋 Olá! Você entrou em contato com o número que fornece mensagens operacionais da CINI BEBIDAS.\n` +
+            `Não monitoramos mensagens recebidas neste canal.\n` +
+            `Para mais informações, entre em contato com o número: ${NUMERO_CONTATO_CINI}`;
+
+        const metadadosBase = { nf: pagamento.NF, txid: pagamento.TXID, origem: 'NotificadorPIX-cliente' };
+        await FilaNotificacoes.create({
+            TIPO_MENSAGEM: 'texto',
+            DESTINATARIO: telefoneCliente,
+            MENSAGEM: mensagemConfirmacao,
+            STATUS: 'PENDENTE',
+            TENTATIVAS: 0,
+            METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
+        });
+        await FilaNotificacoes.create({
+            TIPO_MENSAGEM: 'texto',
+            DESTINATARIO: telefoneCliente,
+            MENSAGEM: mensagemPadrao,
+            STATUS: 'PENDENTE',
+            TENTATIVAS: 0,
+            METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'aviso_padrao_cliente' }),
+        });
+        logger.info(`[Cliente] Confirmação de pagamento enfileirada para ${telefoneCliente} — NF ${pagamento.NF}, TXID: ${pagamento.TXID}`);
+    } catch (err) {
+        logger.error(`[Cliente] Erro ao enfileirar confirmação para o cliente (NF ${pagamento.NF}, TXID: ${pagamento.TXID}): ${err.message}`);
+    }
+}
+
 async function _processarTxidInterno(txid) {
     const pagamento = await VPagamentosPix.findOne({
         where: { TXID: txid },
@@ -164,6 +221,8 @@ async function _processarTxidInterno(txid) {
 
     txidsPendentesPolling.delete(txid);
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
+
+    await enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
 
     await enfileirarAlertaGoogleChat(mensagem);
     const [linhasAfetadas] = await Z16010.update(
