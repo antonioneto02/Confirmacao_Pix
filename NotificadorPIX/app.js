@@ -123,8 +123,7 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
         const valorFormatado = Number(pagamento.VALOR || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const mensagemConfirmacao =
             `🎉 Olá! Recebemos aqui na *Cini Bebidas* o seu pagamento via PIX no valor de *R$ ${valorFormatado}*!\n\n` +
-            `✅ Pagamento confirmado, muito obrigado! 😊\n` +
-            `🚚 Aguarde, seu pedido já está sendo cuidado por aqui.`;
+            `✅ Pagamento confirmado, muito obrigado! 😊`;
         const mensagemPadrao =
             `👋 Olá! Você entrou em contato com o número que fornece mensagens operacionais da CINI BEBIDAS.\n` +
             `Não monitoramos mensagens recebidas neste canal.\n` +
@@ -139,6 +138,11 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             TENTATIVAS: 0,
             METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
         });
+        // Delay proposital antes de enfileirar o segundo aviso: se o primeiro envio
+        // precisar de uma retentativa (raro, mas acontece), inserir os dois quase
+        // juntos deixava esse segundo ser processado antes do primeiro, invertendo
+        // a ordem que o cliente vê no WhatsApp.
+        await sleep(8000);
         await FilaNotificacoes.create({
             TIPO_MENSAGEM: 'texto',
             DESTINATARIO: telefoneCliente,
@@ -222,7 +226,11 @@ async function _processarTxidInterno(txid) {
     txidsPendentesPolling.delete(txid);
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
 
-    await enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
+    // Sem await: enfileirarConfirmacaoParaCliente tem um delay proposital antes do
+    // segundo aviso (ver comentário lá dentro) — não faz sentido segurar o
+    // processamento do TXID (Z16_STENVW, próximo item do polling) por causa disso.
+    // Erros já são tratados dentro da própria função.
+    enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
 
     await enfileirarAlertaGoogleChat(mensagem);
     const [linhasAfetadas] = await Z16010.update(
