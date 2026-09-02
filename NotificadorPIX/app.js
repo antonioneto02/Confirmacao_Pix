@@ -120,17 +120,23 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             return;
         }
 
+        const nomeCliente = (cliente && (cliente.FANTASIA || cliente.NOME)) || pagamento.CLIENTE || 'Cliente';
         const valorFormatado = Number(pagamento.VALOR || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const mensagemConfirmacao =
-            `🎉 Olá! Recebemos aqui na *Cini Bebidas* o seu pagamento via PIX no valor de *R$ ${valorFormatado}*!\n\n` +
-            `✅ Pagamento confirmado, muito obrigado! 😊`;
+            `🎉 Olá! Recebemos aqui na *Cini Bebidas* o pagamento de *${nomeCliente}*!\n\n` +
+            `📄 Número da Nota: ${pagamento.NF}\n` +
+            `📅 Data Emissão: ${pagamento.DT_EMISSAO}\n` +
+            `💰 Valor: R$ ${valorFormatado}\n` +
+            `✅ Data Pagto: ${pagamento.DT_PAGTO}\n` +
+            `🕐 Hora Pagto: ${hrPagto}\n\n` +
+            `Muito obrigado! 😊`;
         const mensagemPadrao =
             `👋 Olá! Você entrou em contato com o número que fornece mensagens operacionais da CINI BEBIDAS.\n` +
             `Não monitoramos mensagens recebidas neste canal.\n` +
             `Para mais informações, entre em contato com o número: ${NUMERO_CONTATO_CINI}`;
 
         const metadadosBase = { nf: pagamento.NF, txid: pagamento.TXID, origem: 'NotificadorPIX-cliente' };
-        await FilaNotificacoes.create({
+        const tarefaConfirmacao = await FilaNotificacoes.create({
             TIPO_MENSAGEM: 'texto',
             DESTINATARIO: telefoneCliente,
             MENSAGEM: mensagemConfirmacao,
@@ -138,11 +144,30 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             TENTATIVAS: 0,
             METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
         });
-        // Delay proposital antes de enfileirar o segundo aviso: se o primeiro envio
-        // precisar de uma retentativa (raro, mas acontece), inserir os dois quase
-        // juntos deixava esse segundo ser processado antes do primeiro, invertendo
-        // a ordem que o cliente vê no WhatsApp.
-        await sleep(8000);
+
+        // Espera a confirmação de pagamento REALMENTE sair antes de enfileirar o
+        // aviso padrão — um delay fixo não bastava: quando o primeiro envio
+        // precisava de retentativa (acontece, o bot às vezes demora/falha), o
+        // aviso padrão (que costuma dar certo de primeira) furava a fila e chegava
+        // antes. Aqui checamos o status de verdade, com um teto de segurança pra
+        // não travar o processamento do TXID indefinidamente se algo travar.
+        const ESPERA_MAX_MS = 3 * 60 * 1000;
+        const INTERVALO_CHECAGEM_MS = 3000;
+        const inicioEspera = Date.now();
+        let statusFinal = null;
+        while (Date.now() - inicioEspera < ESPERA_MAX_MS) {
+            await sleep(INTERVALO_CHECAGEM_MS);
+            const atual = await FilaNotificacoes.findOne({ where: { ID: tarefaConfirmacao.ID }, raw: true });
+            if (!atual) break;
+            if (['ENVIADA', 'FALHA', 'FALHA_DEFINITIVA'].includes(atual.STATUS)) {
+                statusFinal = atual.STATUS;
+                break;
+            }
+        }
+        if (statusFinal !== 'ENVIADA') {
+            logger.warn(`[Cliente] Confirmação de pagamento (ID ${tarefaConfirmacao.ID}) não confirmou ENVIADA a tempo (status: ${statusFinal || 'ainda processando'}) — enfileirando aviso padrão mesmo assim.`);
+        }
+
         await FilaNotificacoes.create({
             TIPO_MENSAGEM: 'texto',
             DESTINATARIO: telefoneCliente,
