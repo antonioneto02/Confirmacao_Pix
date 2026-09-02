@@ -128,7 +128,8 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             `📅 Data Emissão: ${pagamento.DT_EMISSAO}\n` +
             `💰 Valor: R$ ${valorFormatado}\n` +
             `✅ Data Pagto: ${pagamento.DT_PAGTO}\n` +
-            `🕐 Hora Pagto: ${hrPagto}\n\n` +
+            `🕐 Hora Pagto: ${hrPagto}\n` +
+            `🔖 ID da confirmação de pagamento: ${pagamento.TXID}\n\n` +
             `Muito obrigado! 😊`;
         const mensagemPadrao =
             `👋 Olá! Você entrou em contato com o número que fornece mensagens operacionais da CINI BEBIDAS.\n` +
