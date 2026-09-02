@@ -69,11 +69,16 @@ async function processarTxid(txid, fromPolling = false) {
     txidsEmProcessamento.add(txid);
 
     try {
+        // Revalida sempre, mesmo vindo do polling: a lista de pendentes do polling é um
+        // snapshot da query SQL, e pode ficar desatualizada durante o processamento em lote
+        // (alguns segundos) — se uma chamada /notificar concorrente já tiver processado e
+        // marcado STENVW='1' nesse meio tempo, processar de novo pelo polling duplicava a
+        // notificação (mesmo TXID enfileirado 2x).
+        const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
+        if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
+            return null;
+        }
         if (!fromPolling) {
-            const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
-            if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
-                return null;
-            }
             if (baixaExistente && parseInt(baixaExistente.Z16_TPLIQ) !== 2) {
                 logger.info(`[Skip] TXID ${txid} — Z16_TPLIQ=${baixaExistente.Z16_TPLIQ}, notificação ignorada (não é PIX).`);
                 return null;
