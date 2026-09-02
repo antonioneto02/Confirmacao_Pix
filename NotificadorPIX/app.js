@@ -105,6 +105,42 @@ function montarTelefoneCliente(ddd, tel) {
     return limpo.startsWith('55') ? limpo : `55${limpo}`;
 }
 
+// Gera as variantes "com o 9" e "sem o 9" de um número (DDI+DDD+número) pra
+// comparar dois telefones sem se importar com essa diferença de formatação —
+// uma comparação de string exata deixaria passar duplicidade real (mesmo
+// número, um com o 9 e outro sem, chegando como "diferentes").
+function candidatosTelefone(tel) {
+    let limpo = String(tel || '').replace(/\D/g, '');
+    if (!limpo) return [];
+    if (!limpo.startsWith('55')) limpo = '55' + limpo;
+    const candidatos = new Set([limpo]);
+    if (limpo.length === 13) {
+        candidatos.add(limpo.slice(0, 4) + limpo.slice(5));
+    } else if (limpo.length === 12) {
+        candidatos.add(limpo.slice(0, 4) + '9' + limpo.slice(4));
+    }
+    return [...candidatos];
+}
+
+function mesmoTelefone(a, b) {
+    if (!a || !b) return false;
+    const candidatosA = candidatosTelefone(a);
+    const candidatosB = candidatosTelefone(b);
+    return candidatosA.some(c => candidatosB.includes(c));
+}
+
+// Junta uma lista de telefones removendo duplicados "de verdade" (considerando
+// a variação do 9), mantendo a primeira grafia encontrada de cada um.
+function juntarTelefonesSemDuplicar(...telefones) {
+    const unicos = [];
+    for (const tel of telefones) {
+        if (!tel) continue;
+        if (unicos.some(existente => mesmoTelefone(existente, tel))) continue;
+        unicos.push(tel);
+    }
+    return unicos;
+}
+
 async function buscarTelefonePixManual(nf) {
     try {
         // No fluxo manual (motorista pede um QR/copia-e-cola pelo bot pra mandar pro
@@ -179,8 +215,9 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
         const telefoneDB = cliente && montarTelefoneCliente(cliente.DDD, cliente.TEL);
         const telefoneManual = await buscarTelefonePixManual(pagamento.NF);
 
-        // Junta os dois números possíveis sem duplicar quando forem o mesmo.
-        const telefones = [...new Set([telefoneDB, telefoneManual].filter(Boolean))];
+        // Junta os dois números possíveis sem duplicar quando forem o mesmo
+        // (considerando a variação do 9, não só string igual).
+        const telefones = juntarTelefonesSemDuplicar(telefoneDB, telefoneManual);
         if (telefones.length === 0) {
             logger.info(`[Cliente] Nenhum telefone encontrado (nem cadastro, nem fluxo manual) pra NF ${pagamento.NF} — não é possível notificar o cliente.`);
             return;
@@ -193,8 +230,7 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             `📄 Número da Nota: ${pagamento.NF}\n` +
             `📅 Data Emissão: ${pagamento.DT_EMISSAO}\n` +
             `💰 Valor: R$ ${valorFormatado}\n` +
-            `✅ Data Pagto: ${pagamento.DT_PAGTO}\n` +
-            `🕐 Hora Pagto: ${hrPagto}\n` +
+            `✅ Data/Hora Pagto: ${pagamento.DT_PAGTO} às ${hrPagto}\n` +
             `🔖 ID da confirmação de pagamento: ${pagamento.TXID}\n\n` +
             `Muito obrigado! 😊`;
         const mensagemPadrao =
