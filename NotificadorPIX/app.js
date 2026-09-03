@@ -14,7 +14,10 @@ const FatoDocumentosSaidaCapa = require('./fatoDocumentosSaidaCapa');
 const DimClientes = require('./dimClientes');
 const FilaNotificacoes = require('./filaNotificacoes');
 const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
-const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar API oficial do Facebook
+// 'template' forçado em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, provavelmente
+// por iniciar conversa (confirmacao de PIX) com clientes que nunca tinham falado com o bot antes.
+// NAO voltar para 'bot' sem antes tratar isso (ex: so usar o bot pra quem ja iniciou conversa).
+const METODO_ENVIO_CONFIRMACAO_PIX = 'template'; // Mude para "bot" para usar o WhatsApp bot (nao oficial)
 const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
 // ex: '20260415'
