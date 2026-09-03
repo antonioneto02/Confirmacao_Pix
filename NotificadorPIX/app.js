@@ -18,6 +18,14 @@ const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
 // por iniciar conversa (confirmacao de PIX) com clientes que nunca tinham falado com o bot antes.
 // NAO voltar para 'bot' sem antes tratar isso (ex: so usar o bot pra quem ja iniciou conversa).
 const METODO_ENVIO_CONFIRMACAO_PIX = 'template'; // Mude para "bot" para usar o WhatsApp bot (nao oficial)
+
+// DESATIVADO em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, muito provavelmente
+// por ESTE fluxo especificamente — manda mensagem em texto livre pelo bot (nao oficial) direto
+// pro CLIENTE FINAL (nao pro motorista/interno), que na maioria das vezes nunca falou com o
+// numero do bot antes. E exatamente "iniciar conversa com quem nunca falou com a gente", o que
+// o WhatsApp trata como spam fora da janela de 24h/sem template aprovado. NAO reativar sem antes
+// migrar pra Template oficial (como ja foi feito pra confirmacao_pix_bot/template acima).
+const NOTIFICAR_CLIENTE_DESATIVADO = true;
 const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
 // ex: '20260415'
@@ -344,7 +352,11 @@ async function _processarTxidInterno(txid) {
     // segundo aviso (ver comentário lá dentro) — não faz sentido segurar o
     // processamento do TXID (Z16_STENVW, próximo item do polling) por causa disso.
     // Erros já são tratados dentro da própria função.
-    enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
+    if (NOTIFICAR_CLIENTE_DESATIVADO) {
+        logger.warn(`[Cliente] Notificação ao cliente final DESATIVADA (ban do WhatsApp) — não enfileirando confirmação/aviso padrão para NF ${pagamento.NF}, TXID: ${txid}.`);
+    } else {
+        enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
+    }
 
     await enfileirarAlertaGoogleChat(mensagem);
     const [linhasAfetadas] = await Z16010.update(
