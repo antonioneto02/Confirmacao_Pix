@@ -8,6 +8,7 @@ DimMotoristas.init({
     COD_MOTORISTA: { type: DataTypes.STRING, allowNull: true },
     NOME: { type: DataTypes.STRING, allowNull: true },
     WHATSAPP: { type: DataTypes.STRING, allowNull: true },
+    CPF_CNPJ: { type: DataTypes.STRING, allowNull: true },
     ENVIAR_HANDSHAKE: { type: DataTypes.STRING, allowNull: true },
 }, {
     sequelize: sequelizeDW,

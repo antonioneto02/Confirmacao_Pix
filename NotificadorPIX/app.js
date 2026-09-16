@@ -14,10 +14,20 @@ const FatoDocumentosSaidaCapa = require('./fatoDocumentosSaidaCapa');
 const DimClientes = require('./dimClientes');
 const FilaNotificacoes = require('./filaNotificacoes');
 const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
+const APPTRACKING_URL = process.env.APPTRACKING_URL;
+const APPTRACKING_TOKEN = process.env.APPTRACKING_TOKEN;
 // 'template' forçado em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, provavelmente
 // por iniciar conversa (confirmacao de PIX) com clientes que nunca tinham falado com o bot antes.
-// NAO voltar para 'bot' sem antes tratar isso (ex: so usar o bot pra quem ja iniciou conversa).
-const METODO_ENVIO_CONFIRMACAO_PIX = 'template'; // Mude para "bot" para usar o WhatsApp bot (nao oficial)
+// Reativado para 'bot' em 2026-09-08: esse valor so afeta o envio pro MOTORISTA (que ja tem
+// conversa ativa com o bot); o envio direto ao cliente final (causa real do banimento) continua
+// bloqueado separadamente por NOTIFICAR_CLIENTE_DESATIVADO abaixo.
+const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar o Template oficial (Facebook)
+
+// Em transição para push via AppTracking (ver notificarAppTracking): enquanto os motoristas
+// ainda não estão todos com o app atualizado/logado, o WhatsApp continua sendo enviado pra
+// TODOS normalmente (fila FilaNotificacoes abaixo) e o push é enviado ADICIONALMENTE, best-effort,
+// só pra quem já tiver token FCM registrado. NAO remover o envio por WhatsApp até confirmar que a
+// maioria dos motoristas ativos já recebe por push (ver STATUS_ENTREGA_PUSH no histórico do AppTracking).
 
 // DESATIVADO em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, muito provavelmente
 // por ESTE fluxo especificamente — manda mensagem em texto livre pelo bot (nao oficial) direto
@@ -279,6 +289,44 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
     }
 }
 
+async function notificarAppTracking({ motorista, pagamento, txid, hrPagto }) {
+    const cpfMotorista = String(motorista.CPF_CNPJ || '').replace(/\D/g, '');
+    if (!cpfMotorista) {
+        logger.warn(`[AppTracking] Motorista COD_MOTORISTA=${motorista.COD_MOTORISTA} sem CPF_CNPJ em DIM_MOTORISTAS — não é possível notificar via app. TXID: ${txid}`);
+        return false;
+    }
+    if (!APPTRACKING_URL || !APPTRACKING_TOKEN) {
+        logger.warn(`[AppTracking] APPTRACKING_URL/APPTRACKING_TOKEN não configurados — não é possível notificar via app. TXID: ${txid}`);
+        return false;
+    }
+    try {
+        const resp = await fetch(`${APPTRACKING_URL}/api/notificacoes/integracao/pix-confirmado`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Integracao-Token': APPTRACKING_TOKEN },
+            body: JSON.stringify({
+                cpfMotorista,
+                cliente: pagamento.CLIENTE,
+                nf: pagamento.NF,
+                dtEmissao: pagamento.DT_EMISSAO,
+                valor: pagamento.VALOR,
+                dtPagto: pagamento.DT_PAGTO,
+                hrPagto,
+                txid,
+            }),
+            signal: AbortSignal.timeout(15000),
+        });
+        if (!resp.ok) {
+            logger.error(`[AppTracking] Falha ao notificar (HTTP ${resp.status}) — CPF ${cpfMotorista}, TXID ${txid}: ${await resp.text()}`);
+            return false;
+        }
+        logger.info(`[AppTracking] Confirmação de PIX registrada/notificada — CPF ${cpfMotorista}, TXID ${txid}`);
+        return true;
+    } catch (err) {
+        logger.error(`[AppTracking] Erro de rede ao notificar CPF ${cpfMotorista}, TXID ${txid}: ${err.message}`);
+        return false;
+    }
+}
+
 async function _processarTxidInterno(txid) {
     const pagamento = await VPagamentosPix.findOne({
         where: { TXID: txid },
@@ -348,15 +396,21 @@ async function _processarTxidInterno(txid) {
     txidsPendentesPolling.delete(txid);
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
 
+    // Push via AppTracking, ADICIONAL ao WhatsApp acima (não substitui — ver comentário no
+    // topo do arquivo). Best-effort: falha aqui não afeta o envio por WhatsApp nem o
+    // processamento do TXID.
+    const notificouAppTracking = await notificarAppTracking({ motorista, pagamento, txid, hrPagto });
+    if (notificouAppTracking) {
+        logger.info(`Confirmação de PIX também notificada via AppTracking (push) — TXID: ${txid}`);
+    }
+
+    // Confirmação de pagamento pro cliente final DESATIVADA definitivamente em 2026-09-09
+    // (a pedido) — não é mais pra ir. Mantido comentado (não removido) só como referência.
     // Sem await: enfileirarConfirmacaoParaCliente tem um delay proposital antes do
     // segundo aviso (ver comentário lá dentro) — não faz sentido segurar o
     // processamento do TXID (Z16_STENVW, próximo item do polling) por causa disso.
     // Erros já são tratados dentro da própria função.
-    if (NOTIFICAR_CLIENTE_DESATIVADO) {
-        logger.warn(`[Cliente] Notificação ao cliente final DESATIVADA (ban do WhatsApp) — não enfileirando confirmação/aviso padrão para NF ${pagamento.NF}, TXID: ${txid}.`);
-    } else {
-        enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
-    }
+    // enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
 
     await enfileirarAlertaGoogleChat(mensagem);
     const [linhasAfetadas] = await Z16010.update(

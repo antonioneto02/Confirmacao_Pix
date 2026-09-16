@@ -1,9 +1,9 @@
 const { Sequelize } = require('sequelize');
 require('dotenv').config();
 
-const { DB_HOST, DB_USER, DB_PASSWORD_NERIAS } = process.env;
+const { DB_HOST, DB_USER, DB_PASSWORD_NERIAS, DB_NAME_P11PROD } = process.env;
 
-const sequelizeP11Prod = new Sequelize('p11_prod', DB_USER, DB_PASSWORD_NERIAS, {
+const sequelizeP11Prod = new Sequelize(DB_NAME_P11PROD || 'p11_prod', DB_USER, DB_PASSWORD_NERIAS, {
     host: DB_HOST,
     dialect: 'mssql',
     dialectOptions: {
@@ -21,7 +21,7 @@ const sequelizeP11Prod = new Sequelize('p11_prod', DB_USER, DB_PASSWORD_NERIAS, 
 });
 
 sequelizeP11Prod.authenticate()
-    .then(() => console.log('Conexão ao banco p11_prod bem-sucedida!'))
-    .catch(err => console.error('Erro ao conectar ao p11_prod:', err));
+    .then(() => console.log(`Conexão ao banco ${DB_NAME_P11PROD || 'p11_prod'} bem-sucedida!`))
+    .catch(err => console.error(`Erro ao conectar ao ${DB_NAME_P11PROD || 'p11_prod'}:`, err));
 
 module.exports = sequelizeP11Prod;
