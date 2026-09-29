@@ -4,8 +4,8 @@
   "description": "Monitora Z16010 e enfileira notificações de confirmação PIX",
   "main": "app.js",
   "scripts": {
-    "start": "title NotificadorPIX && node app.js",
-    "dev": "nodemon app.js",
+    "start": "title NotificadorPIX && node --disable-warning=DEP0123 app.js",
+    "dev": "nodemon --exec \"node --disable-warning=DEP0123\" app.js",
     "test:unit": "node --test --test-force-exit tests/unit/*.test.js"
   },
   "dependencies": {
