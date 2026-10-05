@@ -249,6 +249,11 @@ jobs:
           if (-not $healthy) {
             Write-Output "Health check failed after deploy. Rolling back to $prevSha"
             docker compose logs --tail=100
+            $failedSha = git rev-parse HEAD
+            $failedBranch = "failed/$env:PM2_APP_NAME-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            git branch $failedBranch $failedSha
+            try { git push origin $failedBranch } catch { Write-Output "Aviso: nao consegui publicar a branch de backup ($failedBranch), mas o commit continua local no runner." }
+            Write-Output "Codigo com erro preservado em '$failedBranch' (commit $failedSha) -- ajuste e rode o deploy de novo quando corrigir."
             git reset --hard $prevSha
           if ($needsRebuild) {
             docker build -t notificador-pix:$prevSha -t notificador-pix:latest .
