@@ -13,6 +13,7 @@ const DimMotoristas = require('./dimMotoristas');
 const FatoDocumentosSaidaCapa = require('./fatoDocumentosSaidaCapa');
 const DimClientes = require('./dimClientes');
 const FilaNotificacoes = require('./filaNotificacoes');
+const reconciliadorOrfaos = require('./reconciliadorOrfaos');
 const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
 const APPTRACKING_URL = process.env.APPTRACKING_URL;
 const APPTRACKING_TOKEN = process.env.APPTRACKING_TOKEN;
@@ -540,4 +541,5 @@ const sslOptions = {
 https.createServer(sslOptions, app).listen(PORT, () => {
     logger.info(`NotificadorPIX API ouvindo na porta ${PORT} (https)`);
     pollingLoop();
+    reconciliadorOrfaos.iniciar();
 });
