@@ -42,13 +42,27 @@ const PORT = parseInt(process.env.PORT);
 // ex: '20260415'
 const POLLING_DATA_FIXA = null;
 
+// Quantos dias para trás o polling revisita. Só olhar o dia atual deixava esquecidos os
+// pendentes de uma queda de banco que atravessasse a meia-noite (ou de uma sexta até segunda).
+const POLLING_DIAS_RETROATIVOS = parseInt(process.env.POLLING_DIAS_RETROATIVOS ?? '3', 10);
+
+function formatarYYYYMMDD(data) {
+    const ano = data.getFullYear();
+    const mes = String(data.getMonth() + 1).padStart(2, '0');
+    const dia = String(data.getDate()).padStart(2, '0');
+    return `${ano}${mes}${dia}`;
+}
+
 function getDataPolling() {
     if (POLLING_DATA_FIXA) return POLLING_DATA_FIXA;
-    const hoje = new Date();
-    const ano = hoje.getFullYear();
-    const mes = String(hoje.getMonth() + 1).padStart(2, '0');
-    const dia = String(hoje.getDate()).padStart(2, '0');
-    return `${ano}${mes}${dia}`;
+    return formatarYYYYMMDD(new Date());
+}
+
+function getDataInicioPolling() {
+    if (POLLING_DATA_FIXA) return POLLING_DATA_FIXA;
+    const inicio = new Date();
+    inicio.setDate(inicio.getDate() - POLLING_DIAS_RETROATIVOS);
+    return formatarYYYYMMDD(inicio);
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -481,12 +495,13 @@ async function pollingLoop() {
         try {
             limparFalhosExpirados();
 
+            const dataInicioPolling = getDataInicioPolling();
             const dataPolling = getDataPolling();
             const pendentes = await Z16010.findAll({
                 attributes: ['Z16_TXID'],
                 where: {
                     Z16_STENVW: '0',
-                    Z16_DTBAIX: dataPolling,
+                    Z16_DTBAIX: { [Op.between]: [dataInicioPolling, dataPolling] },
                     Z16_TPLIQ: 2,
                     Z16_TXID: {
                         [Op.and]: [
@@ -496,12 +511,14 @@ async function pollingLoop() {
                         ],
                     },
                 },
+                order: [['Z16_DTBAIX', 'DESC'], ['Z16_HRBAIX', 'DESC']],
                 limit: LIMITE_POLLING,
                 raw: true,
             });
 
+            const periodoPolling = dataInicioPolling === dataPolling ? dataPolling : `${dataInicioPolling}-${dataPolling}`;
             if (pendentes.length === 0) {
-                logger.info(`[Polling] ${dataPolling} — nenhum pendente. Próximo em ${INTERVALO_LONGO / 60000} min.`);
+                logger.info(`[Polling] ${periodoPolling} — nenhum pendente. Próximo em ${INTERVALO_LONGO / 60000} min.`);
             } else {
                 intervalo = INTERVALO_CURTO; // tem trabalho: volta em 2 min
                 const paraProcessar = pendentes.filter(b =>
@@ -510,7 +527,7 @@ async function pollingLoop() {
                     !txidsEmProcessamento.has(b.Z16_TXID)
                 );
                 logger.info(
-                    `[Polling] ${dataPolling} — ${pendentes.length} pendente(s), ` +
+                    `[Polling] ${periodoPolling} — ${pendentes.length} pendente(s), ` +
                     `${paraProcessar.length} novo(s). Próximo em ${intervalo / 60000} min.`
                 );
                 for (let i = 0; i < paraProcessar.length; i += CONCORRENCIA) {
