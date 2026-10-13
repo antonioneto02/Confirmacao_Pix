@@ -17,33 +17,11 @@ const reconciliadorOrfaos = require('./reconciliadorOrfaos');
 const NUMERO_CONTATO_CINI = process.env.NUMERO_CONTATO || '4130013000';
 const APPTRACKING_URL = process.env.APPTRACKING_URL;
 const APPTRACKING_TOKEN = process.env.APPTRACKING_TOKEN;
-// 'template' forçado em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, provavelmente
-// por iniciar conversa (confirmacao de PIX) com clientes que nunca tinham falado com o bot antes.
-// Reativado para 'bot' em 2026-09-08: esse valor so afeta o envio pro MOTORISTA (que ja tem
-// conversa ativa com o bot); o envio direto ao cliente final (causa real do banimento) continua
-// bloqueado separadamente por NOTIFICAR_CLIENTE_DESATIVADO abaixo.
-const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; // Mude para "template" para usar o Template oficial (Facebook)
-
-// Em transição para push via AppTracking (ver notificarAppTracking): enquanto os motoristas
-// ainda não estão todos com o app atualizado/logado, o WhatsApp continua sendo enviado pra
-// TODOS normalmente (fila FilaNotificacoes abaixo) e o push é enviado ADICIONALMENTE, best-effort,
-// só pra quem já tiver token FCM registrado. NAO remover o envio por WhatsApp até confirmar que a
-// maioria dos motoristas ativos já recebe por push (ver STATUS_ENTREGA_PUSH no histórico do AppTracking).
-
-// DESATIVADO em 2026-09-03: numero do bot foi banido 24h pelo WhatsApp, muito provavelmente
-// por ESTE fluxo especificamente — manda mensagem em texto livre pelo bot (nao oficial) direto
-// pro CLIENTE FINAL (nao pro motorista/interno), que na maioria das vezes nunca falou com o
-// numero do bot antes. E exatamente "iniciar conversa com quem nunca falou com a gente", o que
-// o WhatsApp trata como spam fora da janela de 24h/sem template aprovado. NAO reativar sem antes
-// migrar pra Template oficial (como ja foi feito pra confirmacao_pix_bot/template acima).
+const METODO_ENVIO_CONFIRMACAO_PIX = 'bot'; 
 const NOTIFICAR_CLIENTE_DESATIVADO = true;
 const INTERVALO_POLLING_MS = 120_000;
 const PORT = parseInt(process.env.PORT);
-// ex: '20260415'
 const POLLING_DATA_FIXA = null;
-
-// Quantos dias para trás o polling revisita. Só olhar o dia atual deixava esquecidos os
-// pendentes de uma queda de banco que atravessasse a meia-noite (ou de uma sexta até segunda).
 const POLLING_DIAS_RETROATIVOS = parseInt(process.env.POLLING_DIAS_RETROATIVOS ?? '3', 10);
 
 function formatarYYYYMMDD(data) {
@@ -108,11 +86,6 @@ async function processarTxid(txid, fromPolling = false) {
     txidsEmProcessamento.add(txid);
 
     try {
-        // Revalida sempre, mesmo vindo do polling: a lista de pendentes do polling é um
-        // snapshot da query SQL, e pode ficar desatualizada durante o processamento em lote
-        // (alguns segundos) — se uma chamada /notificar concorrente já tiver processado e
-        // marcado STENVW='1' nesse meio tempo, processar de novo pelo polling duplicava a
-        // notificação (mesmo TXID enfileirado 2x).
         const baixaExistente = await Z16010.findOne({ where: { Z16_TXID: txid } });
         if (baixaExistente && baixaExistente.Z16_STENVW === '1') {
             return null;
@@ -139,11 +112,6 @@ function montarTelefoneCliente(ddd, tel) {
     const dddLimpo = String(ddd || '').replace(/\D/g, '');
     const telLimpo = String(tel || '').replace(/\D/g, '');
     if (!telLimpo) return null;
-
-    // Em alguns cadastros o TEL já vem com o DDD embutido (ex.: DDD=41,
-    // TEL=41987042945) — concatenar o DDD de novo nesse caso gerava um número
-    // com dígitos a mais (inválido), e o bot ficava tentando várias formas de
-    // resolver esse número quebrado, chegando a mandar a mensagem mais de uma vez.
     const telJaTemDDD = dddLimpo && telLimpo.startsWith(dddLimpo) && [10, 11].includes(telLimpo.length);
     const numeroLocal = telJaTemDDD ? telLimpo : (dddLimpo + telLimpo);
 
@@ -151,10 +119,6 @@ function montarTelefoneCliente(ddd, tel) {
     return numeroLocal.startsWith('55') ? numeroLocal : `55${numeroLocal}`;
 }
 
-// Gera as variantes "com o 9" e "sem o 9" de um número (DDI+DDD+número) pra
-// comparar dois telefones sem se importar com essa diferença de formatação —
-// uma comparação de string exata deixaria passar duplicidade real (mesmo
-// número, um com o 9 e outro sem, chegando como "diferentes").
 function candidatosTelefone(tel) {
     let limpo = String(tel || '').replace(/\D/g, '');
     if (!limpo) return [];
@@ -175,8 +139,6 @@ function mesmoTelefone(a, b) {
     return candidatosA.some(c => candidatosB.includes(c));
 }
 
-// Junta uma lista de telefones removendo duplicados "de verdade" (considerando
-// a variação do 9), mantendo a primeira grafia encontrada de cada um.
 function juntarTelefonesSemDuplicar(...telefones) {
     const unicos = [];
     for (const tel of telefones) {
@@ -189,11 +151,6 @@ function juntarTelefonesSemDuplicar(...telefones) {
 
 async function buscarTelefonePixManual(nf) {
     try {
-        // No fluxo manual (motorista pede um QR/copia-e-cola pelo bot pra mandar pro
-        // cliente — ver WhatsAppWebNode/enviarMensagensPixPara), o número usado nem
-        // sempre é o mesmo cadastrado em DIM_CLIENTES (pode ser outro contato da
-        // pessoa que realmente vai pagar). Isso fica registrado na própria fila com
-        // METADADOS.tipo='pix_automatico' — usamos o registro mais recente pra essa NF.
         const registro = await FilaNotificacoes.findOne({
             where: {
                 TIPO_MENSAGEM: 'texto',
@@ -219,12 +176,6 @@ async function enviarParConfirmacaoCliente(telefone, mensagemConfirmacao, mensag
         METADADOS: JSON.stringify({ ...metadadosBase, tipo: 'confirmacao_pagamento_cliente' }),
     });
 
-    // Espera a confirmação de pagamento REALMENTE sair antes de enfileirar o
-    // aviso padrão — um delay fixo não bastava: quando o primeiro envio
-    // precisava de retentativa (acontece, o bot às vezes demora/falha), o
-    // aviso padrão (que costuma dar certo de primeira) furava a fila e chegava
-    // antes. Aqui checamos o status de verdade, com um teto de segurança pra
-    // não travar o processamento do TXID indefinidamente se algo travar.
     const ESPERA_MAX_MS = 3 * 60 * 1000;
     const INTERVALO_CHECAGEM_MS = 3000;
     const inicioEspera = Date.now();
@@ -260,13 +211,7 @@ async function enfileirarConfirmacaoParaCliente(pagamento, hrPagto) {
             : null;
         const telefoneDB = cliente && montarTelefoneCliente(cliente.DDD, cliente.TEL);
         const telefoneManual = await buscarTelefonePixManual(pagamento.NF);
-
-        // Junta os dois números possíveis sem duplicar quando forem o mesmo
-        // (considerando a variação do 9, não só string igual).
         const candidatos = juntarTelefonesSemDuplicar(telefoneDB, telefoneManual);
-        // Rede de segurança contra outras inconsistências de cadastro (DDI+DDD+número
-        // válido tem 12 ou 13 dígitos) — número fora disso é rejeitado em vez de
-        // mandado, pra não repetir o problema do DDD embutido em dobro no TEL.
         const telefones = candidatos.filter(tel => {
             const valido = [12, 13].includes(tel.length);
             if (!valido) {
@@ -410,22 +355,10 @@ async function _processarTxidInterno(txid) {
 
     txidsPendentesPolling.delete(txid);
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
-
-    // Push via AppTracking, ADICIONAL ao WhatsApp acima (não substitui — ver comentário no
-    // topo do arquivo). Best-effort: falha aqui não afeta o envio por WhatsApp nem o
-    // processamento do TXID.
     const notificouAppTracking = await notificarAppTracking({ motorista, pagamento, txid, hrPagto });
     if (notificouAppTracking) {
         logger.info(`Confirmação de PIX também notificada via AppTracking (push) — TXID: ${txid}`);
     }
-
-    // Confirmação de pagamento pro cliente final DESATIVADA definitivamente em 2026-09-09
-    // (a pedido) — não é mais pra ir. Mantido comentado (não removido) só como referência.
-    // Sem await: enfileirarConfirmacaoParaCliente tem um delay proposital antes do
-    // segundo aviso (ver comentário lá dentro) — não faz sentido segurar o
-    // processamento do TXID (Z16_STENVW, próximo item do polling) por causa disso.
-    // Erros já são tratados dentro da própria função.
-    // enfileirarConfirmacaoParaCliente(pagamento, hrPagto);
 
     await enfileirarAlertaGoogleChat(mensagem);
     const [linhasAfetadas] = await Z16010.update(
@@ -481,11 +414,10 @@ app.post('/notificar', async (req, res) => {
 
 const LIMITE_POLLING   = 100;
 const CONCORRENCIA     = 3;
-const INTERVALO_CURTO  = 120_000;   // 2 min — quando há pendentes conhecidos
-const INTERVALO_LONGO  = 600_000;   // 10 min — quando está tudo processado
+const INTERVALO_CURTO  = 120_000;   
+const INTERVALO_LONGO  = 600_000;   
 
 async function pollingLoop() {
-    // Delay inicial aleatório (15-45s) para desincronizar do log-watcher
     const jitter = 15_000 + Math.floor(Math.random() * 30_000);
     logger.info(`[Polling] Iniciado — primeiro ciclo em ${Math.round(jitter / 1000)}s.`);
     await sleep(jitter);
@@ -520,7 +452,7 @@ async function pollingLoop() {
             if (pendentes.length === 0) {
                 logger.info(`[Polling] ${periodoPolling} — nenhum pendente. Próximo em ${INTERVALO_LONGO / 60000} min.`);
             } else {
-                intervalo = INTERVALO_CURTO; // tem trabalho: volta em 2 min
+                intervalo = INTERVALO_CURTO; 
                 const paraProcessar = pendentes.filter(b =>
                     !txidsBoleto.has(b.Z16_TXID) &&
                     !txidsFalhos.has(b.Z16_TXID) &&
