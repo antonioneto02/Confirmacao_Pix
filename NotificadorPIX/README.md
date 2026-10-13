@@ -50,7 +50,7 @@ O serviço segue um fluxo de **polling + cadeia de consultas**:
 
 O sistema usa **dois bancos SQL Server** via Sequelize/Tedious:
 
-### Banco P11_Prod (Protheus)
+### Banco p2510 (Protheus, servidor remoto)
 
 | Tabela/View | Uso |
 |---|---|
@@ -73,7 +73,7 @@ O sistema usa **dois bancos SQL Server** via Sequelize/Tedious:
 | **central-notificacoes** | Consumidor da fila | Processa mensagens da `FATO_FILA_NOTIFICACOES` |
 | **whatsapp-bot** | Envio de mensagens | Envia a confirmação PIX via WhatsApp para o motorista |
 | **Google Chat** | Alertas | Recebe alertas da equipe sobre novos pagamentos via fila |
-| **Protheus (P11_Prod)** | Banco de dados | Leitura da Z16010 e V_PAGAMENTOS_PIX |
+| **Protheus (p2510)** | Banco de dados | Leitura da Z16010 e V_PAGAMENTOS_PIX |
 
 ## ⚙️ Variáveis de Ambiente
 
@@ -81,10 +81,10 @@ O sistema usa **dois bancos SQL Server** via Sequelize/Tedious:
 PORT=3013                          # Porta do servidor Express
 
 # Banco de Dados
-DB_HOST=                           # Host do SQL Server
+DB_HOST=177.104.136.230            # SQL Server remoto (o mesmo das demais APIs)
 DB_USER=                           # Usuário do banco
 DB_PASSWORD_NERIAS=                # Senha do banco
-DB_NAME_P11PROD=                   # Nome do banco Protheus (p11_prod)
+DB_NAME_P11PROD=p2510              # Banco do Protheus (padrão p2510; o antigo p2510 não é mais usado)
 
 # Configurações
 METODO_ENVIO_CONFIRMACAO_PIX=bot   # Método de envio: "bot" ou "template"
