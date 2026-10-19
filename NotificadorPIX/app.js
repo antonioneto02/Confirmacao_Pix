@@ -375,6 +375,10 @@ async function _processarTxidInterno(txid) {
 const { swaggerUi, swaggerDocument } = require('./swagger');
 
 const app = express();
+const f2b = require('./security/cini-fail2ban');
+app.use(f2b.guard('notificador-pix', {rateLimit: false}));
+// Rotas internas: so rede da Cini. Publicas para a internet: /health.
+app.use(f2b.apenasRedeCini('notificador-pix', ['/health']));
 app.use(express.json());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
