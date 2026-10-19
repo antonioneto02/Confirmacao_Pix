@@ -24,7 +24,10 @@ function clientIp(req) {
 }
 
 const REDES_CINI = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10',
-  '177.104.136.227/32', '200.225.247.91/32', '200.225.247.159/32'];
+  '177.104.136.227/32', '200.225.247.91/32', '200.225.247.159/32',
+  // liberados em 19/10/2026 (mesma lista da Whitelist do IPBan)
+  '45.182.132.102/32', '201.48.9.65/32', '151.245.54.63/32', '177.126.4.190/32', '177.198.74.248/32',
+  '177.104.136.224/29', '143.137.87.235/32'];
 
 function ipv4ParaInt(ip) {
   const p = String(ip).split('.');
@@ -173,7 +176,8 @@ function apenasRedeCini(appName, publicas = []) {
     if (ipDaCini(ip)) return next();
     const caminho = (req.path || '/').replace(/\/+$/, '') || '/';
     if (regras.some(r => (!r.metodo || r.metodo === req.method) && r.testa(caminho))) return next();
-    registrar('RATE_LIMIT', req, appName);
+    // So recusa, NAO conta para ban: um usuario legitimo fora da lista (ex.: escritorio com IP novo)
+    // abrindo a app 3x baniria o IP inteiro (aconteceu com 45.182.132.102 em 19/10/2026).
     return res.status(403).json({ error: 'Acesso negado' });
   };
 }
