@@ -1,2 +1,5 @@
 ﻿
 logs/security/
+# Estado que o reconciliador regrava sozinho: versionado, cada gravacao virava "alteracao do
+# servidor" -> commit + deploy automatico (e commits concorrentes divergindo do remoto).
+state/
