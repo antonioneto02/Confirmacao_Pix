@@ -10,7 +10,6 @@ const JANELA_BUSCA_ORFAOS_DIAS = 60;
 const JANELA_TITULO_EMISSAO_DIAS = 60;        
 const ARQUIVO_ESTADO = path.join(__dirname, 'state', 'orfaos-alertados.json');
 const RETENCAO_ESTADO_DIAS = 120;            
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function formatarYYYYMMDD(data) {
@@ -69,10 +68,6 @@ async function buscarCandidatos(orfao) {
     const dataMin = formatarYYYYMMDD(new Date(dtBaixa.getTime() - JANELA_TITULO_EMISSAO_DIAS * 24 * 60 * 60 * 1000));
     const dataMax = formatarYYYYMMDD(new Date(dtBaixa.getTime() + 24 * 60 * 60 * 1000)); 
 
-    // Direto nas tabelas do Protheus, com o mesmo filtro das views dw.dbo.FATO_TITULOS_RECEBER /
-    // DIM_CLIENTES. Na view a emissao vira CONVERT(DATETIME, E1_EMISSAO): filtrar por ela varria a
-    // SE1010 inteira (~3 mi linhas, ~2,3 s; passava dos 15 s de timeout com o Protheus carregado).
-    // Comparando E1_EMISSAO como texto AAAAMMDD o SQL usa o indice SE10106 (filial + emissao): ~12 ms.
     return sequelizeDW.query(
         `SELECT A.E1_FILIAL AS CODFIL, A.E1_CLIENTE AS CODCLI, A.E1_LOJA AS LOJACLI,
                 RTRIM(A.E1_PREFIXO) AS PREFIXO, A.E1_NUM AS NUMERO, RTRIM(A.E1_PARCELA) AS PARCELA,
