@@ -69,18 +69,29 @@ async function buscarCandidatos(orfao) {
     const dataMin = formatarYYYYMMDD(new Date(dtBaixa.getTime() - JANELA_TITULO_EMISSAO_DIAS * 24 * 60 * 60 * 1000));
     const dataMax = formatarYYYYMMDD(new Date(dtBaixa.getTime() + 24 * 60 * 60 * 1000)); 
 
+    // Direto nas tabelas do Protheus, com o mesmo filtro das views dw.dbo.FATO_TITULOS_RECEBER /
+    // DIM_CLIENTES. Na view a emissao vira CONVERT(DATETIME, E1_EMISSAO): filtrar por ela varria a
+    // SE1010 inteira (~3 mi linhas, ~2,3 s; passava dos 15 s de timeout com o Protheus carregado).
+    // Comparando E1_EMISSAO como texto AAAAMMDD o SQL usa o indice SE10106 (filial + emissao): ~12 ms.
     return sequelizeDW.query(
-        `SELECT A.CODFIL, A.CODCLI, A.LOJACLI, A.PREFIXO, A.NUMERO, A.PARCELA, A.TIPO,
-                A.DATA, A.VENCTO, A.VENCREA, A.VALOR, A.SALDO,
-                C.NOME AS CLIENTE_NOME, C.FANTASIA AS CLIENTE_FANTASIA
-         FROM dw.dbo.FATO_TITULOS_RECEBER A WITH (NOLOCK)
-         LEFT JOIN dw.dbo.DIM_CLIENTES C WITH (NOLOCK)
-                ON A.CODCLI = C.COD_CLIENTE AND A.LOJACLI = C.LOJA
-         WHERE A.SALDO > 0
-           AND A.TIPO NOT IN ('RA','NCC','NDC')
-           AND RTRIM(A.CODFIL) = RTRIM(:filial)
-           AND CAST(A.SALDO AS DECIMAL(18,2)) = CAST(:valor AS DECIMAL(18,2))
-           AND CONVERT(VARCHAR(8), A.DATA, 112) BETWEEN :dataMin AND :dataMax`,
+        `SELECT A.E1_FILIAL AS CODFIL, A.E1_CLIENTE AS CODCLI, A.E1_LOJA AS LOJACLI,
+                RTRIM(A.E1_PREFIXO) AS PREFIXO, A.E1_NUM AS NUMERO, RTRIM(A.E1_PARCELA) AS PARCELA,
+                RTRIM(A.E1_TIPO) AS TIPO, CONVERT(DATETIME, A.E1_EMISSAO) AS DATA,
+                CONVERT(DATE, A.E1_VENCTO) AS VENCTO, CONVERT(DATE, A.E1_VENCREA) AS VENCREA,
+                CONVERT(FLOAT, A.E1_VALOR) AS VALOR, CONVERT(FLOAT, A.E1_SALDO) AS SALDO,
+                RTRIM(C.A1_NOME) AS CLIENTE_NOME, RTRIM(C.A1_NREDUZ) AS CLIENTE_FANTASIA
+         FROM ${PROTHEUS_DB}.dbo.SE1010 A WITH (NOLOCK)
+         JOIN ${PROTHEUS_DB}.dbo.SED010 B WITH (NOLOCK)
+                ON B.ED_CODIGO = A.E1_NATUREZ AND B.D_E_L_E_T_ <> '*'
+         LEFT JOIN ${PROTHEUS_DB}.dbo.SA1010 C WITH (NOLOCK)
+                ON C.A1_COD = A.E1_CLIENTE AND C.A1_LOJA = A.E1_LOJA AND C.D_E_L_E_T_ <> '*'
+         WHERE A.E1_FILIAL = :filial
+           AND A.E1_EMISSAO BETWEEN :dataMin AND :dataMax
+           AND A.E1_EMISSAO >= '20230101'
+           AND A.D_E_L_E_T_ <> '*'
+           AND A.E1_SALDO > 0
+           AND RTRIM(A.E1_TIPO) NOT IN ('RA','NCC','NDC')
+           AND CAST(A.E1_SALDO AS DECIMAL(18,2)) = CAST(:valor AS DECIMAL(18,2))`,
         {
             replacements: { filial: orfao.FILIAL, valor: orfao.VALOR, dataMin, dataMax },
             type: QueryTypes.SELECT,
