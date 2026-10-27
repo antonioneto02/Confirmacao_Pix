@@ -47,8 +47,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const txidsEmProcessamento = new Set();
 const txidsPendentesPolling = new Set();
 const txidsBoleto = new Set();
-const txidsFalhos = new Map(); 
-const TTL_FALHOS_MS = 60 * 60 * 1000; 
+// TXID que falhou (ex.: F71 ainda nao gravada) volta a ser tentado com espera crescente:
+// 30s, 1min, 2min... ate 1h. Antes ficava bloqueado 1h direto, atrasando a confirmacao ao motorista.
+const txidsFalhos = new Map();
+const ESPERA_FALHA_INICIAL_MS = 30 * 1000;
+const ESPERA_FALHA_MAX_MS = 60 * 60 * 1000;
+const TTL_FALHOS_MS = 24 * 60 * 60 * 1000;
 
 function limparFalhosExpirados() {
     const agora = Date.now();
@@ -57,6 +61,11 @@ function limparFalhosExpirados() {
             txidsFalhos.delete(txid);
         }
     }
+}
+
+function aguardandoNovaTentativa(txid) {
+    const entry = txidsFalhos.get(txid);
+    return Boolean(entry) && Date.now() < entry.proximaTentativa;
 }
 
 async function enfileirarAlertaGoogleChat(mensagem) {
@@ -80,7 +89,7 @@ async function processarTxid(txid, fromPolling = false) {
     if (txidsEmProcessamento.has(txid)) {
         return null;
     }
-    if (txidsFalhos.has(txid)) {
+    if (aguardandoNovaTentativa(txid)) {
         return null;
     }
     txidsEmProcessamento.add(txid);
@@ -104,8 +113,12 @@ async function processarTxid(txid, fromPolling = false) {
 }
 
 function registrarFalha(txid, motivo) {
-    txidsFalhos.set(txid, { motivo, timestamp: Date.now() });
-    logger.warn(`[Falho] TXID ${txid} — ${motivo}.`);
+    const anterior = txidsFalhos.get(txid);
+    const tentativas = (anterior ? anterior.tentativas : 0) + 1;
+    const espera = Math.min(ESPERA_FALHA_INICIAL_MS * 2 ** (tentativas - 1), ESPERA_FALHA_MAX_MS);
+    const agora = Date.now();
+    txidsFalhos.set(txid, { motivo, timestamp: anterior ? anterior.timestamp : agora, tentativas, proximaTentativa: agora + espera });
+    logger.warn(`[Falho] TXID ${txid} — ${motivo}. Tentativa ${tentativas}; nova tentativa em ${Math.round(espera / 1000)}s.`);
 }
 
 function montarTelefoneCliente(ddd, tel) {
@@ -354,6 +367,7 @@ async function _processarTxidInterno(txid) {
     });
 
     txidsPendentesPolling.delete(txid);
+    txidsFalhos.delete(txid);
     logger.info(`Notificação enfileirada para ${motorista.WHATSAPP} — TXID: ${txid}`);
     const notificouAppTracking = await notificarAppTracking({ motorista, pagamento, txid, hrPagto });
     if (notificouAppTracking) {
@@ -418,8 +432,10 @@ app.post('/notificar', async (req, res) => {
 
 const LIMITE_POLLING   = 100;
 const CONCORRENCIA     = 3;
-const INTERVALO_CURTO  = 120_000;   
-const INTERVALO_LONGO  = 600_000;   
+// Rede de seguranca do /notificar (ex.: NotificadorPIX reiniciando quando o webhook Sicredi chamou):
+// com 2/10 min a confirmacao ao motorista podia atrasar ate 10 min.
+const INTERVALO_CURTO  = 30_000;
+const INTERVALO_LONGO  = 60_000;
 
 async function pollingLoop() {
     const jitter = 15_000 + Math.floor(Math.random() * 30_000);
@@ -459,7 +475,7 @@ async function pollingLoop() {
                 intervalo = INTERVALO_CURTO; 
                 const paraProcessar = pendentes.filter(b =>
                     !txidsBoleto.has(b.Z16_TXID) &&
-                    !txidsFalhos.has(b.Z16_TXID) &&
+                    !aguardandoNovaTentativa(b.Z16_TXID) &&
                     !txidsEmProcessamento.has(b.Z16_TXID)
                 );
                 logger.info(
