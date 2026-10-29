@@ -46,10 +46,7 @@ function getDataInicioPolling() {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const txidsEmProcessamento = new Set();
 const txidsPendentesPolling = new Set();
-const txidsBoleto = new Set();
-// TXID que falhou (ex.: F71 ainda nao gravada) volta a ser tentado com espera crescente:
-// 30s, 1min, 2min... ate 1h. Antes ficava bloqueado 1h direto, atrasando a confirmacao ao motorista.
-const txidsFalhos = new Map();
+const txidsBoleto = new Set();const txidsFalhos = new Map();
 const ESPERA_FALHA_INICIAL_MS = 30 * 1000;
 const ESPERA_FALHA_MAX_MS = 60 * 60 * 1000;
 const TTL_FALHOS_MS = 24 * 60 * 60 * 1000;
@@ -391,7 +388,6 @@ const { swaggerUi, swaggerDocument } = require('./swagger');
 const app = express();
 const f2b = require('./security/cini-fail2ban');
 app.use(f2b.guard('notificador-pix', {rateLimit: false}));
-// Rotas internas: so rede da Cini. Publicas para a internet: /health.
 app.use(f2b.apenasRedeCini('notificador-pix', ['/health']));
 app.use(express.json());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
@@ -432,8 +428,6 @@ app.post('/notificar', async (req, res) => {
 
 const LIMITE_POLLING   = 100;
 const CONCORRENCIA     = 3;
-// Rede de seguranca do /notificar (ex.: NotificadorPIX reiniciando quando o webhook Sicredi chamou):
-// com 2/10 min a confirmacao ao motorista podia atrasar ate 10 min.
 const INTERVALO_CURTO  = 30_000;
 const INTERVALO_LONGO  = 60_000;
 
