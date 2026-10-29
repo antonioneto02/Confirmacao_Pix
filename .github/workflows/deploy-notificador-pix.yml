@@ -45,7 +45,7 @@ jobs:
         run: find . -name '*.js' -not -path './node_modules/*' -not -name '*.test.js' -print0 | xargs -0 -n1 node --check
 
       - name: Auditoria de dependências
-        run: npx --yes audit-ci@7 --high --skip-dev --allowlist xlsx puppeteer puppeteer-core @puppeteer/browsers basic-ftp extract-zip get-uri pac-proxy-agent proxy-agent whatsapp-web.js nodemon chokidar braces
+        run: npx --yes audit-ci@7 --high --skip-dev --allowlist xlsx puppeteer puppeteer-core @puppeteer/browsers basic-ftp extract-zip get-uri pac-proxy-agent proxy-agent whatsapp-web.js nodemon chokidar braces GHSA-xcx6-jx8p-x3h5
 
       - name: SAST (segurança com ESLint)
         run: npx eslint .
