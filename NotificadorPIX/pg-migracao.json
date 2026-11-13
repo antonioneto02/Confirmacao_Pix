@@ -1,0 +1,15 @@
+{
+  "app": "notificador-pix",
+  "grupo": "notificacoes",
+  "origem": {
+    "database": "DB_DATABASE_DW",
+    "databasePadrao": "dw"
+  },
+  "tabelas": [],
+  "health": {
+    "porta": 3013,
+    "caminho": "/health",
+    "banco": "/health/banco",
+    "https": true
+  }
+}

@@ -392,6 +392,7 @@ app.use(f2b.apenasRedeCini('notificador-pix', ['/health']));
 app.use(express.json());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
+app.get('/health/banco', require('./database/saudeBancoPg')('SELECT 1 AS x', 'dw'));
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', service: 'notificador-pix' });
 });

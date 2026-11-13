@@ -126,7 +126,11 @@ function trocarApply(texto) {
 }
 
 function contarComoInteiro(texto) {
-  const re = /\bCOUNT\s*\(/i;
+  return envolverAgregado(texto, 'COUNT', 'INTEGER');
+}
+
+function envolverAgregado(texto, funcao, tipo) {
+  const re = new RegExp(`\\b${funcao}\\s*\\(`, 'i');
   let saida = texto;
   let m;
   let guarda = 0;
@@ -141,9 +145,9 @@ function contarComoInteiro(texto) {
       janela = saida.slice(final, fimOver + 1);
       final = fimOver + 1;
     }
-    saida = `${saida.slice(0, m.index)}CAST(__CONTAR__(${args.join(', ')})${janela} AS INTEGER)${saida.slice(final)}`;
+    saida = `${saida.slice(0, m.index)}CAST(__AGREGADO__(${args.join(', ')})${janela} AS ${tipo})${saida.slice(final)}`;
   }
-  return saida.replace(/__CONTAR__\(/g, 'COUNT(');
+  return saida.replace(/__AGREGADO__\(/g, `${funcao}(`);
 }
 
 function trocarTop(texto) {
@@ -237,15 +241,21 @@ function normalizarGrafia(grafia) {
 function referencias(t, g) {
   const semTexto = t.replace(/'(?:[^']|'')*'/g, "''");
   const apelidos = new Map();
+  const todos = new Map();
   const tabelas = [];
   for (const m of semTexto.matchAll(/\b(FROM|JOIN|INTO|UPDATE)\s+(?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?("?)([A-Za-z_][\w$]*)\2(?:\s+(?:AS\s+)?("?)([A-Za-z_][\w$]*)\4)?/gi)) {
     const tabela = m[3].toLowerCase();
+    const apelido = m[5] && !PALAVRAS_SQL.has(m[5].toUpperCase()) ? m[5].toLowerCase() : null;
+    const conhecida = g.tabelas.has(tabela) && !PALAVRAS_SQL.has(m[3].toUpperCase());
+    const anotar = (chave) => todos.set(chave, [...(todos.get(chave) || []), conhecida ? tabela : null]);
+    if (!PALAVRAS_SQL.has(m[3].toUpperCase())) anotar(tabela);
+    if (apelido) anotar(apelido);
     if (!g.tabelas.has(tabela)) continue;
     tabelas.push(tabela);
     apelidos.set(tabela, tabela);
     if (m[5] && !PALAVRAS_SQL.has(m[5].toUpperCase()) && !g.tabelas.has(m[5].toLowerCase())) apelidos.set(m[5].toLowerCase(), tabela);
   }
-  return { apelidos, tabelas };
+  return { apelidos, tabelas, todos };
 }
 
 const CLAUSULAS = /\b(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|SET|VALUES|RETURNING|ON|JOIN|LIMIT|UNION|INTO|USING|WHEN|THEN|ELSE|AND|OR|PARTITION\s+BY|OVER)\b/gi;
@@ -293,13 +303,66 @@ function escoposDe(semTexto, g) {
       for (let k = filho.ini; k <= filho.fim; k++) proprio[k - e.ini - 1] = ' ';
     }
     proprio = proprio.join('');
-    e.tabelas = referencias(proprio, g).tabelas;
+    const refs = referencias(proprio, g);
+    e.tabelas = refs.tabelas;
+    e.todos = refs.todos;
+    e.isolado = e.ini >= 0 && /\b(AS|FROM|JOIN)\s*$/i.test(semTexto.slice(Math.max(0, e.ini - 30), e.ini));
   }
   return escopos;
 }
 
+function colunasDeSaida(corpo, g) {
+  const sel = /^\s*SELECT\s+(?:DISTINCT\s+)?(?:TOP\s*\(?\s*\d+\s*\)?\s+)?/i.exec(corpo);
+  const saida = new Map();
+  if (!sel) return saida;
+  const de = posicaoNoTopo(corpo, /FROM\b/iy, sel[0].length);
+  const lista = corpo.slice(sel[0].length, de ? de.i : corpo.length);
+  const refs = referencias(corpo, g);
+  const deTabela = (tb) => { for (const [k, v] of g.colunas.get(tb) || []) if (!saida.has(k)) saida.set(k, v); };
+  for (const item of dividirVirgulas(lista)) {
+    const it = item.trim();
+    let m;
+    if (it === '*') { refs.tabelas.forEach(deTabela); continue; }
+    if ((m = /^"?([A-Za-z_][\w$]*)"?\s*\.\s*\*$/.exec(it))) { const tb = refs.apelidos.get(m[1].toLowerCase()); if (tb) deTabela(tb); continue; }
+    if ((m = /\bAS\s+("?)([^"\s]+)\1\s*$/i.exec(it))) { saida.set(m[2].toLowerCase(), m[1] ? m[2] : m[2].toLowerCase()); continue; }
+    if ((m = /^(?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?([A-Za-z_][\w$]*)"?$/.exec(it))) { saida.set(m[1].toLowerCase(), m[1].toLowerCase()); continue; }
+    if ((m = /\s("?)([A-Za-z_][\w$]*)\1\s*$/.exec(it)) && !PALAVRAS_SQL.has(m[2].toUpperCase())) saida.set(m[2].toLowerCase(), m[1] ? m[2] : m[2].toLowerCase());
+  }
+  return saida;
+}
+
+function comCtes(t, g) {
+  if (!g || !g.colunas.size || !/^\s*WITH\b/i.test(t)) return g;
+  const sem = t.replace(/'(?:[^']|'')*'/g, (x) => "'" + ' '.repeat(x.length - 2) + "'");
+  const novo = { ...g, tabelas: new Map(g.tabelas), colunas: new Map(g.colunas) };
+  let i = /^\s*WITH\s+(?:RECURSIVE\s+)?/i.exec(sem)[0].length;
+  for (;;) {
+    const cab = /^\s*"?([A-Za-z_][\w$]*)"?\s*(?:\(([^()]*)\))?\s*AS\s*\(/i.exec(sem.slice(i));
+    if (!cab) break;
+    const abre = i + cab[0].length - 1;
+    let fim;
+    try { fim = argumentos(sem, abre).fim; } catch { break; }
+    const nome = cab[1].toLowerCase();
+    let cols = new Map();
+    if (cab[2]) {
+      for (const c of cab[2].split(',')) {
+        const n = c.trim();
+        if (n) cols.set(n.replace(/"/g, '').toLowerCase(), n.startsWith('"') ? n.replace(/"/g, '') : n.toLowerCase());
+      }
+    } else {
+      cols = colunasDeSaida(sem.slice(abre + 1, fim), novo);
+    }
+    novo.tabelas.set(nome, nome);
+    novo.colunas.set(nome, cols);
+    const virgula = /^\s*,/.exec(sem.slice(fim + 1));
+    if (!virgula) break;
+    i = fim + 1 + virgula[0].length;
+  }
+  return novo;
+}
+
 function ajustarGrafia(t, grafiaBruta) {
-  const g = normalizarGrafia(grafiaBruta);
+  const g = comCtes(t, normalizarGrafia(grafiaBruta));
   if (!g || !g.tabelas.size) return t;
   const { apelidos: aliasTabela, tabelas: usadas } = referencias(t, g);
   const legado = !g.colunas.size;
@@ -315,19 +378,31 @@ function ajustarGrafia(t, grafiaBruta) {
   const coluna = (nome, qualificador, onde) => {
     const k = nome.toLowerCase();
     if (qualificador) {
-      const tabela = aliasTabela.get(qualificador.toLowerCase());
+      const q = qualificador.toLowerCase();
+      if (!legado && onde !== undefined) {
+        const dono = escopos.filter((e) => onde > e.ini && onde < e.fim && e.todos && e.todos.has(q)).sort((a, b) => (a.fim - a.ini) - (b.fim - b.ini))[0];
+        if (dono) {
+          for (const daqui of dono.todos.get(q)) {
+            const colsDaqui = daqui && g.colunas.get(daqui);
+            if (colsDaqui && colsDaqui.has(k)) return colsDaqui.get(k);
+          }
+          return undefined;
+        }
+      }
+      const tabela = aliasTabela.get(q);
       const cols = tabela && g.colunas.get(tabela);
       if (cols && cols.has(k)) return cols.get(k);
       return legado ? (g.global.get(k) || undefined) : undefined;
     }
     const visiveis = legado || onde === undefined
-      ? [usadas]
-      : escopos.filter((e) => onde > e.ini && onde < e.fim).sort((a, b) => (a.fim - a.ini) - (b.fim - b.ini)).map((e) => e.tabelas);
-    for (const lista of visiveis) {
-      for (const tabela of lista) {
+      ? [{ tabelas: usadas, isolado: false }]
+      : escopos.filter((e) => onde > e.ini && onde < e.fim).sort((a, b) => (a.fim - a.ini) - (b.fim - b.ini));
+    for (const escopo of visiveis) {
+      for (const tabela of escopo.tabelas) {
         const cols = g.colunas.get(tabela);
         if (cols && cols.has(k)) return cols.get(k);
       }
+      if (escopo.isolado) return undefined;
     }
     return legado || !usadas.length ? (g.global.get(k) || undefined) : undefined;
   };
@@ -351,6 +426,8 @@ function ajustarGrafia(t, grafiaBruta) {
     const antes = todo.slice(0, pos);
     const depois = todo.slice(pos + inteiro.length);
     if (/\bAS\s*$/i.test(antes) || /::\s*$/.test(antes)) return inteiro;
+    if (/\bAS\s+"?[A-Za-z_][\w$]*"?\s*\((?:\s*"?[A-Za-z_][\w$]*"?\s*,)*\s*$/i.test(antes)) return inteiro;
+    if (!aspas && /\b(FROM|JOIN|UPDATE)\s+(?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?\s+(?:AS\s+)?$/i.test(antes) && !PALAVRAS_SQL.has(nome.toUpperCase())) return inteiro;
     if (apelidosSaida.has(nome) && !/\.\s*$/.test(antes) && /\bORDER\s+BY\b[^()]*$/i.test(antes)) return inteiro;
     if (!aspas && /^\(/.test(depois) && !/\b(INTO|FROM|JOIN|UPDATE)\s+$/i.test(antes)) return inteiro;
     if (!aspas && PALAVRAS_SQL.has(nome.toUpperCase())) return inteiro;
@@ -433,8 +510,15 @@ function traduzirUpdateFrom(t) {
   return `${t.slice(0, upd.i)}UPDATE ${item[1]} AS __alvo SET ${sets.join(', ')} FROM${fromTexto.trimEnd()} WHERE __alvo.ctid = ${alvo}.ctid${onde ? ` AND (${resto.trim()})` : ''}`;
 }
 
+function traduzirExec(cmd) {
+  const m = /^\s*EXEC(?:UTE)?\s+(?!sp_)((?:\[?[A-Za-z_]\w*\]?\.){0,2}\[?[A-Za-z_]\w*\]?)\s*([\s\S]*?)\s*$/i.exec(cmd);
+  if (!m) return cmd;
+  const args = m[2] ? dividirVirgulas(m[2]).map((a) => a.replace(/^@\w+\s*=\s*/, '')) : [];
+  return `CALL ${m[1]}(${args.join(', ')})`;
+}
+
 function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
-  const cmd = traduzirSeNaoExiste(cmdOriginal);
+  const cmd = traduzirExec(traduzirSeNaoExiste(cmdOriginal));
   const prefixoBanco = (inteiro, banco) => (ESQUEMAS && !bancosProtheus().has(banco.toLowerCase()) ? `"${bancoNoPostgres(banco)}".` : '');
   let t = foraDeTexto(cmd, (p) => p.replace(/\[?([A-Za-z_]\w*)\]?\.\[?dbo\]?\.(?=\[?[A-Za-z_#])/gi, prefixoBanco).replace(/(?<![\w\]."])\[?([A-Za-z_]\w*)\]?\.\.(?=\[?[A-Za-z_#])/g, prefixoBanco));
   if (/^\s*MERGE\b/i.test(t)) t = traduzirMerge(t.replace(/\[?dbo\]?\./gi, '').replace(/\[([A-Za-z_][A-Za-z0-9_ ]*)\]/g, '$1').replace(/\bWITH\s*\(\s*HOLDLOCK\s*\)/gi, ''));
@@ -456,15 +540,18 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   const bloqueia = /\bWITH\s*\(\s*[^)]*\bUPDLOCK\b[^)]*\)/i.test(t);
   t = t.replace(/\bWITH\s*\(\s*(NOLOCK|UPDLOCK|HOLDLOCK|ROWLOCK|READPAST|TABLOCK|TABLOCKX|READUNCOMMITTED)(\s*,\s*(NOLOCK|UPDLOCK|HOLDLOCK|ROWLOCK|READPAST|TABLOCK|TABLOCKX|READUNCOMMITTED))*\s*\)/gi, '');
   t = t.replace(/\(\s*NOLOCK\s*\)/gi, '');
+  t = t.replace(/\bOPTION\s*\((?:[^()']|\([^()]*\))*\)\s*$/i, '');
   t = t.replace(/\b(GETDATE|SYSDATETIME|CURRENT_TIMESTAMP)\s*\(\s*\)/gi, 'LOCALTIMESTAMP');
   t = t.replace(/\b(GETUTCDATE|SYSUTCDATETIME)\s*\(\s*\)/gi, "(now() AT TIME ZONE 'utc')");
   t = t.replace(/\bNOW\s*\(\s*\)/gi, 'LOCALTIMESTAMP');
   t = t.replace(/\s+COLLATE\s+[A-Za-z0-9_]+/gi, '');
   t = t.replace(/\bISNULL\s*\(/gi, 'COALESCE(');
   t = t.replace(/\bLEN\s*\(/gi, 'LENGTH(');
+  t = t.replace(/(?<!\bAS\s*)(?<!\bCONVERT\s*\(\s*)\bN?CHAR\s*\(\s*(\d+)\s*\)/gi, 'chr($1)');
   t = trocarFuncao(t, 'EOMONTH', ([d, n]) => `CAST(date_trunc('month', CAST(${d} AS TIMESTAMP)${n ? ` + (${n}) * INTERVAL '1 month'` : ''}) + INTERVAL '1 month' - INTERVAL '1 day' AS DATE)`);
   t = trocarFuncao(t, 'DATEFROMPARTS', ([a, m, d]) => `make_date(CAST(${a} AS INTEGER), CAST(${m} AS INTEGER), CAST(${d} AS INTEGER))`);
-  t = trocarFuncao(t, 'ISDATE', ([x]) => `(CASE WHEN CAST(${x} AS TEXT) ~ '^\\s*[0-9]{4}-?[0-9]{2}-?[0-9]{2}' THEN 1 ELSE 0 END)`);
+  t = trocarFuncao(t, 'ISNUMERIC', ([x]) => `(CASE WHEN CAST(${x} AS TEXT) ~ '^\\s*[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)\\s*$' THEN 1 ELSE 0 END)`);
+  t = trocarFuncao(t, 'ISDATE',([x]) => `(CASE WHEN CAST(${x} AS TEXT) ~ '^\\s*[0-9]{4}-?[0-9]{2}-?[0-9]{2}' THEN 1 ELSE 0 END)`);
   const conversaoSegura = (tipo, expr) => {
     const nome = String(tipo).trim().toUpperCase();
     let padrao = null;
@@ -531,7 +618,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   t = trocarFuncao(t, 'CHARINDEX', ([agulha, palheiro]) => `POSITION((${agulha}) IN (${palheiro}))`);
   t = trocarFuncao(t, 'IIF', ([cond, a, b]) => `(CASE WHEN ${cond} THEN ${a} ELSE ${b} END)`);
   t = contarComoInteiro(t);
-  t = trocarFuncao(t, 'SUM', (args) => `CAST(__SOMAR__(${args.join(', ')}) AS DOUBLE PRECISION)`).replace(/__SOMAR__\(/g, 'SUM(');
+  t = envolverAgregado(t, 'SUM', 'DOUBLE PRECISION');
   const apelidos = new Set();
   t = t.replace(/\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b/g, (inteiro, nome) => {
     if (!(/[A-Z]/.test(nome) && /[a-z]/.test(nome))) return inteiro;
@@ -542,10 +629,16 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
     t = t.replace(/\bORDER\s+BY\s+([^()';]*)/gi, (inteiro, lista) => `ORDER BY ${lista.replace(/(?<!["\w.])([A-Za-z_][A-Za-z0-9_]*)(?!["\w.(])/g, (n) => (apelidos.has(n) ? `"${n}"` : n))}`);
   }
   let retorno = null;
-  t = t.replace(/\bOUTPUT\s+((?:INSERTED|DELETED)\.(?:\*|\w+)(?:\s+AS\s+\w+)?(?:\s*,\s*(?:INSERTED|DELETED)\.(?:\*|\w+)(?:\s+AS\s+\w+)?)*)/i, (_m, lista) => {
-    retorno = lista.replace(/\b(INSERTED|DELETED)\./gi, '');
-    return '';
-  });
+  const saidaOutput = posicaoNoTopo(t, /OUTPUT\s+/iy);
+  if (saidaOutput) {
+    const inicioLista = saidaOutput.i + saidaOutput.m[0].length;
+    const fimLista = posicaoNoTopo(t, /(?:VALUES|SELECT|WHERE|FROM|DEFAULT\s+VALUES)\b/iy, inicioLista);
+    const lista = t.slice(inicioLista, fimLista ? fimLista.i : t.length).trim();
+    if (/\b(INSERTED|DELETED)\./i.test(lista) && !/\bINTO\b/i.test(lista)) {
+      retorno = lista.replace(/\b(INSERTED|DELETED)\./gi, '');
+      t = t.slice(0, saidaOutput.i) + (fimLista ? t.slice(fimLista.i) : '');
+    }
+  }
   t = trocarTop(t);
   if (retorno) t = `${t.trimEnd()} RETURNING ${retorno}`;
   if (bloqueia) t = `${t.trimEnd()} FOR UPDATE`;
@@ -560,6 +653,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
 }
 
 function ehDdlSqlServer(c) {
+  if (/\b(CREATE\s+(TABLE|UNIQUE|INDEX|NONCLUSTERED|CLUSTERED|VIEW|PROC|PROCEDURE|FUNCTION|TRIGGER|SCHEMA)|ALTER\s+(TABLE|VIEW|PROC|PROCEDURE|FUNCTION|INDEX|SCHEMA)|DROP\s+(TABLE|INDEX|VIEW|CONSTRAINT|PROC|PROCEDURE|FUNCTION|TRIGGER|SCHEMA)|TRUNCATE\s+TABLE|SELECT\s+[\s\S]*?\bINTO\s+#)\b/i.test(c.replace(/'(?:[^']|'')*'/g, "''"))) return true;
   if (/\bOBJECT_ID\s*\(|\bCOL_LENGTH\s*\(|\bsys\.(tables|columns|indexes|objects)\b|\bsysobjects\b/i.test(c)) return true;
   if (/^\s*SET\s+(NOCOUNT|XACT_ABORT|ANSI_|QUOTED_IDENTIFIER|DATEFORMAT|LANGUAGE)\b/i.test(c)) return true;
   if (/^\s*(BEGIN|END)\s*$/i.test(c)) return true;
@@ -648,6 +742,12 @@ function numerosComoTexto(t, grafia) {
     const tipo = tipoDeColuna(g, refs, op);
     return !!tipo && /char|text/i.test(tipo);
   };
+  const data = (op) => {
+    if (PALAVRAS_SQL.has(op.replace(/"/g, '').toUpperCase())) return false;
+    const tipo = tipoDeColuna(g, refs, op);
+    return !!tipo && /date|time/i.test(tipo);
+  };
+  t = t.replace(new RegExp(String.raw`${COLUNA_REF}(\s*(?:=|<>|!=)\s*)''`, 'g'), (m, col, op) => (data(col) ? `${col}${op}'1900-01-01'` : m));
   return foraDeTexto(t, (p) => p
     .replace(new RegExp(String.raw`${COLUNA_REF}(\s*(?:=|<>|!=|>=|<=|>|<)\s*)${NUMERO}`, 'g'), (m, col, op, num) => (texto(col) ? `${col}${op}'${num}'` : m))
     .replace(/(?<![\w$".])(-?\d+(?:\.\d+)?)(\s*(?:=|<>|!=)\s*)((?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?)(?![\w$"(.])/g,(m, num, op, col) => (texto(col) ? `'${num}'${op}${col}` : m))
@@ -689,6 +789,26 @@ function colunaIdentidade(insert, grafia) {
   return real === real.toLowerCase() ? real : `"${real}"`;
 }
 
+function upsertPorRowcount(texto) {
+  const m = /^\s*(UPDATE\b[\s\S]+?)\s*;?\s*IF\s+@@ROWCOUNT\s*=\s*0\s*(?:BEGIN\s+)?(INSERT\s+INTO\s+[^(]+\([^)]*\))\s*VALUES\s*\(([\s\S]+)\)\s*;?\s*(?:END)?\s*;?\s*$/i.exec(texto);
+  if (!m) return texto;
+  return `WITH __atualizados AS (${m[1]} RETURNING 1) ${m[2]} SELECT ${m[3]} WHERE NOT EXISTS (SELECT 1 FROM __atualizados)`;
+}
+
+function semComentarios(texto) {
+  let saida = '';
+  let aspas = false;
+  for (let i = 0; i < texto.length; i++) {
+    const c = texto[i];
+    if (aspas) { saida += c; if (c === "'") aspas = false; continue; }
+    if (c === "'") { aspas = true; saida += c; continue; }
+    if (c === '-' && texto[i + 1] === '-') { while (i < texto.length && texto[i] !== '\n') i++; saida += '\n'; continue; }
+    if (c === '/' && texto[i + 1] === '*') { const fim = texto.indexOf('*/', i + 2); i = fim < 0 ? texto.length : fim + 1; saida += ' '; continue; }
+    saida += c;
+  }
+  return saida;
+}
+
 function usarVariaveis(texto, vars) {
   if (!vars.size) return texto;
   return foraDeTexto(texto, (p) => p.replace(/(?<![@\w])@(\w+)(?!\w)/g, (m, n) => {
@@ -716,10 +836,11 @@ function declararVariaveis(c, vars) {
 }
 
 function traduzir(sqlTexto, params = {}, prefixo = '@', utc = false, grafia = null) {
-  const comandos = dividirComandos(separarIdentidade(sqlTexto));
+  const comandos = dividirComandos(separarIdentidade(upsertPorRowcount(semComentarios(sqlTexto))));
   const saida = [];
   const variaveis = new Map();
   for (let i = 0; i < comandos.length; i++) {
+    if (/\bsys\.(?:columns|tables|objects|key_constraints|indexes|index_columns|foreign_keys|default_constraints|schemas)\b|\bOBJECT_ID\s*\(|\bEXEC(?:UTE)?\s*\(/i.test(comandos[i])) continue;
     if (declararVariaveis(comandos[i], variaveis)) continue;
     const c = usarVariaveis(comandos[i], variaveis);
     const identidade = /^\s*SELECT\s+(?:CAST\s*\(\s*)?SCOPE_IDENTITY\s*\(\s*\)(?:\s+AS\s+\w+\s*\))?\s+AS\s+(\w+)\s*$/i.exec(c) || /^\s*SELECT\s+@@IDENTITY\s+AS\s+(\w+)\s*$/i.exec(c);

@@ -5,7 +5,8 @@ const sqlPg = require('./mssqlPg');
 const PG = sqlPg.dialeto() === 'postgres';
 const SQL_CATALOGO = `SELECT c.table_schema AS s, c.table_name AS t, c.column_name AS c FROM information_schema.columns c
   WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')`;
-const PARECE_TSQL = /\[[A-Za-z_][\w ]*\]|\bTOP\s*\(?\s*[\d@:]|\bGETDATE\s*\(|\bISNULL\s*\(|\bNOLOCK\b|\bdbo\.|\bNVARCHAR\b|\bOUTPUT\s+INSERTED\b|\bDATEADD\s*\(|\bDATEDIFF\s*\(|\bCONVERT\s*\(|\bLEN\s*\(|\bCHARINDEX\s*\(|@@|\bIIF\s*\(|\bTRY_CONVERT\s*\(|\bTRY_CAST\s*\(|\bMERGE\b|\bOUTER\s+APPLY\b|\bCROSS\s+APPLY\b|\bFORMAT\s*\(|\bYEAR\s*\(|\bMONTH\s*\(|\bDAY\s*\(|\bCOLLATE\b/i;
+const DDL = /\b(CREATE\s+(TABLE|UNIQUE|INDEX|VIEW|SCHEMA|SEQUENCE|TYPE|TRIGGER|FUNCTION|PROCEDURE|OR\s+REPLACE)|ALTER\s+(TABLE|VIEW|SCHEMA|SEQUENCE|TYPE|INDEX)|DROP\s+(TABLE|INDEX|VIEW|SCHEMA|SEQUENCE|TYPE|CONSTRAINT|TRIGGER|FUNCTION|PROCEDURE)|TRUNCATE(\s+TABLE)?\s+[\w"[])/i;
+const PARECE_TSQL =/\[[A-Za-z_][\w ]*\]|\bTOP\s*\(?\s*[\d@:]|\bGETDATE\s*\(|\bISNULL\s*\(|\bNOLOCK\b|\bdbo\.|\bNVARCHAR\b|\bOUTPUT\s+INSERTED\b|\bDATEADD\s*\(|\bDATEDIFF\s*\(|\bCONVERT\s*\(|\bLEN\s*\(|\bCHARINDEX\s*\(|@@|\bIIF\s*\(|\bTRY_CONVERT\s*\(|\bTRY_CAST\s*\(|\bMERGE\b|\bOUTER\s+APPLY\b|\bCROSS\s+APPLY\b|\bFORMAT\s*\(|\bYEAR\s*\(|\bMONTH\s*\(|\bDAY\s*\(|\bCOLLATE\b/i;
 
 const bancoNoPostgres = (nome) => process.env[`PG_BANCO_${String(nome).toUpperCase()}`] || nome;
 
@@ -68,12 +69,15 @@ function criar(Sequelize, { banco: bancoInformado, usuario, senha, host, porta, 
   const queryOriginal = instancia.query.bind(instancia);
   instancia.query = function query(sqlOuObjeto, opcoesQuery = {}) {
     const texto = typeof sqlOuObjeto === 'string' ? sqlOuObjeto : sqlOuObjeto && sqlOuObjeto.query;
+    const vazio = () => Promise.resolve(opcoesQuery && opcoesQuery.type === 'SELECT' ? [] : [[], 0]);
+    if (typeof texto === 'string' && DDL.test(texto.replace(/'(?:[^']|'')*'/g, "''"))) return vazio();
     if (typeof texto !== 'string' || (opcoesQuery && (opcoesQuery.model || opcoesQuery.instance))) return queryOriginal(sqlOuObjeto, opcoesQuery);
     const destino = sqlPg.destinoDaConsulta(texto, banco);
     if (destino.tipo === 'mssql') return sqlServer().query(sqlOuObjeto, opcoesQuery);
     if (!esquemas && destino.banco !== nome) throw new Error(`consulta do banco ${destino.banco} feita pela conexão de ${nome}: use a conexão desse banco`);
     if (!PARECE_TSQL.test(texto)) return queryOriginal(sqlOuObjeto, opcoesQuery);
     const traduzido = sqlPg.traduzir(texto, {}, '@').filter((c) => !c.startsWith('--ROWCOUNT')).join(';\n');
+    if (!traduzido.trim()) return vazio();
     return queryOriginal(typeof sqlOuObjeto === 'string' ? traduzido : { ...sqlOuObjeto, query: traduzido }, opcoesQuery);
   };
   const fecharOriginal = instancia.close.bind(instancia);
@@ -81,6 +85,13 @@ function criar(Sequelize, { banco: bancoInformado, usuario, senha, host, porta, 
     await fecharOriginal();
     if (legado) await legado.close();
   };
+  const semAlterarTabelas = async function () { return this; };
+  instancia.sync = semAlterarTabelas;
+  instancia.drop = semAlterarTabelas;
+  instancia.addHook('afterDefine', (model) => {
+    model.sync = semAlterarTabelas;
+    model.drop = semAlterarTabelas;
+  });
   return instancia;
 }
 
