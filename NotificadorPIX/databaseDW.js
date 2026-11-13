@@ -3,9 +3,12 @@ require('dotenv').config();
 
 const { DB_HOST, DB_USER, DB_PASSWORD_NERIAS } = process.env;
 
-const sequelizeDW = new Sequelize('dw', DB_USER, DB_PASSWORD_NERIAS, {
-    host: DB_HOST,
-    dialect: 'mssql',
+const sequelizeDW = require('./database/sequelizePg').criar(Sequelize, {
+  banco: 'dw',
+  usuario: DB_USER,
+  senha: DB_PASSWORD_NERIAS,
+  host: DB_HOST,
+  opcoes: {
     dialectOptions: {
         options: {
             connectTimeout: 5000,
@@ -18,6 +21,7 @@ const sequelizeDW = new Sequelize('dw', DB_USER, DB_PASSWORD_NERIAS, {
         acquire: 30000,
         idle: 10000,
     },
+  },
 });
 
 sequelizeDW.authenticate()
