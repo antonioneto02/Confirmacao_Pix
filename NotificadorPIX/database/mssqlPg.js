@@ -105,6 +105,26 @@ function trocarFuncao(texto, nome, montar) {
   return saida;
 }
 
+function trocarApply(texto) {
+  const re = /\b(OUTER|CROSS)\s+APPLY\s*\(/i;
+  let saida = texto;
+  let m;
+  let guarda = 0;
+  while ((m = re.exec(saida)) && guarda++ < 1000) {
+    const abre = m.index + m[0].length - 1;
+    const { fim } = argumentos(saida, abre);
+    const resto = saida.slice(fim + 1);
+    const apelido = /^\s+(?:AS\s+)?("?[A-Za-z_][\w$]*"?(?:\s*\([^()]*\))?)/i.exec(resto);
+    const valido = apelido && !/^(WHERE|ON|JOIN|GROUP|ORDER|UNION|LEFT|INNER|CROSS|OUTER|RIGHT|FULL|HAVING|LIMIT|OFFSET)$/i.test(apelido[1]);
+    const fimApelido = valido ? apelido[0].length : 0;
+    const juncao = m[1].toUpperCase() === 'OUTER' ? 'LEFT JOIN LATERAL (' : 'CROSS JOIN LATERAL (';
+    const corpo = saida.slice(abre + 1, fim);
+    const nome = valido ? apelido[0] : ' __lateral';
+    saida = saida.slice(0, m.index) + juncao + corpo + ')' + nome + (m[1].toUpperCase() === 'OUTER' ? ' ON TRUE' : '') + resto.slice(fimApelido);
+  }
+  return saida;
+}
+
 function trocarTop(texto) {
   const re = /\bSELECT\s+(DISTINCT\s+)?TOP\s*(\(\s*([^)]+?)\s*\)|(\d+|[@:][A-Za-z_]\w*))(\s+PERCENT)?/i;
   let saida = texto;
@@ -207,10 +227,50 @@ function referencias(t, g) {
   return { apelidos, tabelas };
 }
 
+const CLAUSULAS = /\b(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|SET|VALUES|RETURNING|ON|JOIN|LIMIT|UNION|INTO|USING|WHEN|THEN|ELSE|AND|OR|PARTITION\s+BY|OVER)\b/gi;
+
+function itemDeSelect(antes, depois) {
+  if (!/^\s*(,|\bFROM\b)/i.test(depois)) return false;
+  if (!/(\bSELECT\s+(DISTINCT\s+)?|,)\s*("?[A-Za-z_][\w$]*"?\s*\.\s*)?$/i.test(antes)) return false;
+  let profundidade = 0;
+  let inicio = 0;
+  for (let i = antes.length - 1; i >= 0; i--) {
+    const c = antes[i];
+    if (c === ')') profundidade++;
+    else if (c === '(') { if (profundidade === 0) { inicio = i + 1; break; } profundidade--; }
+  }
+  let ultima = null;
+  for (const m of antes.slice(inicio).replace(/\([^()]*\)/g, ' ').matchAll(CLAUSULAS)) ultima = m[1].toUpperCase();
+  return ultima === 'SELECT';
+}
+
+const NAO_APELIDO = /^(WHERE|ON|JOIN|GROUP|ORDER|UNION|LEFT|INNER|CROSS|OUTER|RIGHT|FULL|HAVING|LIMIT|OFFSET|AND|OR|AS|SELECT|FROM|SET|VALUES|RETURNING)$/i;
+
+function derivadas(semTexto) {
+  const lista = [];
+  for (let i = 0; i < semTexto.length; i++) {
+    if (semTexto[i] !== '(' || !/^\(\s*SELECT\b/i.test(semTexto.slice(i, i + 40))) continue;
+    let n = 0;
+    let j = i;
+    for (; j < semTexto.length; j++) { if (semTexto[j] === '(') n++; else if (semTexto[j] === ')') { n--; if (n === 0) break; } }
+    const a = /^\s*(?:AS\s+)?"?([A-Za-z_][\w$]*)"?/i.exec(semTexto.slice(j + 1));
+    if (a && !NAO_APELIDO.test(a[1])) lista.push({ nome: a[1].toLowerCase(), ini: i, fim: j });
+  }
+  return lista;
+}
+
 function ajustarGrafia(t, grafiaBruta) {
   const g = normalizarGrafia(grafiaBruta);
   if (!g || !g.tabelas.size) return t;
   const { apelidos: aliasTabela, tabelas: usadas } = referencias(t, g);
+  const legado = !g.colunas.size;
+  const semTextoIgual = t.replace(/'(?:[^']|'')*'/g, (x) => "'" + ' '.repeat(x.length - 2) + "'");
+  const subconsultas = derivadas(semTextoIgual);
+  const daSubconsulta = (qualificador, onde) => {
+    const k = qualificador.toLowerCase();
+    const mesmas = subconsultas.filter((d) => d.nome === k);
+    return mesmas.length > 0 && !mesmas.some((d) => onde > d.ini && onde < d.fim);
+  };
   const apelidosSaida = new Set([...t.replace(/'(?:[^']|'')*'/g, "''").matchAll(/\bAS\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?/gi)].map((m) => m[1]));
   const coluna = (nome, qualificador) => {
     const k = nome.toLowerCase();
@@ -218,16 +278,20 @@ function ajustarGrafia(t, grafiaBruta) {
       const tabela = aliasTabela.get(qualificador.toLowerCase());
       const cols = tabela && g.colunas.get(tabela);
       if (cols && cols.has(k)) return cols.get(k);
-      return cols ? undefined : (g.global.get(k) || undefined);
+      return legado ? (g.global.get(k) || undefined) : undefined;
     }
     for (const tabela of usadas) {
       const cols = g.colunas.get(tabela);
       if (cols && cols.has(k)) return cols.get(k);
     }
-    const global = g.global.get(k);
-    return global || undefined;
+    return legado || !usadas.length ? (g.global.get(k) || undefined) : undefined;
   };
-  return foraDeTexto(t, (parte) => parte.replace(/(?<![\w$"])("?)([A-Za-z_][A-Za-z0-9_$]*)\1(?![\w$"])/g, (inteiro, aspas, nome, pos, todo) => {
+  let deslocamento = 0;
+  return t.split(/('(?:[^']|'')*')/).map((parte, indice) => {
+    const base = deslocamento;
+    deslocamento += parte.length;
+    if (indice % 2) return parte;
+    return parte.replace(/(?<![\w$"])("?)([A-Za-z_][A-Za-z0-9_$]*)\1(?![\w$"])/g, (inteiro, aspas, nome, pos, todo) => {
     const antes = todo.slice(0, pos);
     const depois = todo.slice(pos + inteiro.length);
     if (/\bAS\s*$/i.test(antes) || /::\s*$/.test(antes)) return inteiro;
@@ -235,19 +299,22 @@ function ajustarGrafia(t, grafiaBruta) {
     if (!aspas && /^\(/.test(depois) && !/\b(INTO|FROM|JOIN|UPDATE)\s+$/i.test(antes)) return inteiro;
     if (!aspas && PALAVRAS_SQL.has(nome.toUpperCase())) return inteiro;
     const k = nome.toLowerCase();
-    if (/^\s*\./.test(depois) && g.esquemas && g.esquemas.has(k) && !g.tabelas.has(k)) return aspas ? inteiro : `"${nome}"`;
+    if (/^\s*\./.test(depois) && g.esquemas && g.esquemas.has(k) && (!g.tabelas.has(k) || /\b(FROM|JOIN|INTO|UPDATE)\s+$/i.test(antes))) return aspas ? inteiro : `"${nome}"`;
     let real;
     const posicaoTabela = /\b(FROM|JOIN|INTO|UPDATE)\s+("?[A-Za-z_][\w$]*"?\s*\.\s*)?$/i.test(antes) || (/^\s*\./.test(depois) && g.tabelas.has(k) && !(aliasTabela.has(k) && aliasTabela.get(k) !== k));
     if (posicaoTabela) real = g.tabelas.get(k);
     else if (/^\s*\./.test(depois) && aliasTabela.has(k)) return inteiro;
     else {
       const q = /([A-Za-z_][\w$]*)"?\s*\.\s*$/.exec(antes);
+      if (q && daSubconsulta(q[1], base + pos)) return inteiro;
       real = coluna(nome, q ? q[1] : null);
     }
     if (!real) return inteiro;
     if (real === real.toLowerCase()) return aspas ? real : inteiro;
+    if (!posicaoTabela && !legado && itemDeSelect(antes, depois)) return `"${real}" AS ${nome}`;
     return `"${real}"`;
-  }));
+    });
+  }).join('');
 }
 function traduzirSeNaoExiste(cmd) {
   const m = /^\s*IF\s+NOT\s+EXISTS\s*\(/i.exec(cmd);
@@ -332,6 +399,13 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
     }
     return `CAST(${expr} AS ${tipo})`;
   });
+  t = trocarApply(t);
+  t = t.replace(/\bSTRING_SPLIT\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(\s+(?:AS\s+)?([A-Za-z_]\w*))?/gi, (inteiro, args, _a, apelido) => {
+    const [valor, separador] = dividirVirgulas(args);
+    const nome = apelido && !/^(WHERE|ON|JOIN|GROUP|ORDER|UNION|LEFT|INNER|CROSS)$/i.test(apelido) ? apelido : '__partes';
+    const sobra = apelido && nome === '__partes' ? ` ${apelido}` : '';
+    return `unnest(string_to_array(${valor}, ${separador})) AS ${nome}(value)${sobra}`;
+  });
   t = trocarFuncao(t, 'CHARINDEX', ([agulha, palheiro]) => `POSITION((${agulha}) IN (${palheiro}))`);
   t = trocarFuncao(t, 'IIF', ([cond, a, b]) => `(CASE WHEN ${cond} THEN ${a} ELSE ${b} END)`);
   t = trocarFuncao(t, 'COUNT', (args) => `CAST(__CONTAR__(${args.join(', ')}) AS INTEGER)`).replace(/__CONTAR__\(/g, 'COUNT(');
@@ -360,7 +434,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
     const v = params[chave];
     return literal(catalogo && typeof v === 'string' ? v.toLowerCase() : v, utc);
   });
-  return catalogo ? t : ajustarGrafia(t, grafia);
+  return catalogo ? t : ajustarGrafia(concatenar(t, grafia), grafia);
 }
 
 function ehDdlSqlServer(c) {
@@ -372,14 +446,112 @@ function ehDdlSqlServer(c) {
   return false;
 }
 
+function separarIdentidade(texto) {
+  return foraDeTexto(texto, (p) => p.replace(/([^;\s])(\s+)(SELECT\s+(?:CAST\s*\(\s*)?(?:SCOPE_IDENTITY\s*\(\s*\)|@@IDENTITY\b|@@ROWCOUNT\b))/gi, '$1;$2$3'));
+}
+
+function operandoAntes(t, fim) {
+  let i = fim;
+  while (i > 0 && /\s/.test(t[i - 1])) i--;
+  const fimOp = i;
+  if (t[i - 1] === "'") {
+    let j = i - 2;
+    while (j >= 0) { if (t[j] === "'") { if (t[j - 1] === "'") { j -= 2; continue; } break; } j--; }
+    return t.slice(j, fimOp);
+  }
+  if (t[i - 1] === ')') {
+    let n = 0;
+    let j = i - 1;
+    for (; j >= 0; j--) { if (t[j] === ')') n++; else if (t[j] === '(') { n--; if (n === 0) break; } }
+    let k = j;
+    while (k > 0 && /[\w$]/.test(t[k - 1])) k--;
+    return t.slice(k, fimOp);
+  }
+  let k = i;
+  while (k > 0 && /[\w$".]/.test(t[k - 1])) k--;
+  return t.slice(k, fimOp);
+}
+
+function operandoDepois(t, inicio) {
+  let i = inicio;
+  while (i < t.length && /\s/.test(t[i])) i++;
+  if (t[i] === "'") {
+    let j = i + 1;
+    while (j < t.length) { if (t[j] === "'") { if (t[j + 1] === "'") { j += 2; continue; } break; } j++; }
+    return t.slice(i, j + 1);
+  }
+  let k = i;
+  while (k < t.length && /[\w$".]/.test(t[k])) k++;
+  if (t[k] === '(' || (k === i && t[i] === '(')) {
+    let n = 0;
+    let j = k;
+    for (; j < t.length; j++) { if (t[j] === '(') n++; else if (t[j] === ')') { n--; if (n === 0) break; } }
+    return t.slice(i, j + 1);
+  }
+  return t.slice(i, k);
+}
+
+function ehTexto(op, colunaTipo) {
+  const o = op.trim();
+  if (!o) return false;
+  if (/^'/.test(o)) return true;
+  if (/^(RTRIM|LTRIM|TRIM|UPPER|LOWER|SUBSTRING|SUBSTR|LEFT|RIGHT|REPLACE|CONCAT|REPLICATE|LPAD|RPAD|to_char)\s*\(/i.test(o)) return true;
+  if (/^(CAST|CONVERT)\s*\(/i.test(o) && /\bAS\s+(N?VARCHAR|N?CHAR|TEXT|CHARACTER)\b|\(\s*(N?VARCHAR|N?CHAR)\b/i.test(o)) return true;
+  if (/^COALESCE\s*\(/i.test(o) && /'/.test(o)) return true;
+  if (/^"?[A-Za-z_][\w$]*"?(\s*\.\s*"?[A-Za-z_][\w$]*"?)?$/.test(o)) return colunaTipo(o);
+  return false;
+}
+
+function concatenar(t, grafia) {
+  const g = normalizarGrafia(grafia);
+  const refs = g && g.colunas.size ? referencias(t, g) : null;
+  const colunaTipo = (op) => {
+    if (!g || !g.tipos) return false;
+    const partes = op.replace(/"/g, '').split('.').map((x) => x.trim().toLowerCase());
+    const col = partes.pop();
+    const tabelas = partes.length ? [refs && refs.apelidos.get(partes[0])].filter(Boolean) : (refs ? refs.tabelas : []);
+    for (const tabela of tabelas) {
+      const tipo = g.tipos.get(tabela) && g.tipos.get(tabela).get(col);
+      if (tipo) return /char|text|uuid/i.test(tipo);
+    }
+    return false;
+  };
+  let saida = '';
+  let i = 0;
+  let aspas = false;
+  while (i < t.length) {
+    const c = t[i];
+    if (aspas) { saida += c; if (c === "'") { if (t[i + 1] === "'") { saida += t[++i]; } else aspas = false; } i++; continue; }
+    if (c === "'") { aspas = true; saida += c; i++; continue; }
+    if (c === '+' && t[i + 1] !== '=') {
+      const esquerda = operandoAntes(t, i);
+      const direita = operandoDepois(t, i + 1);
+      if (ehTexto(esquerda, colunaTipo) || ehTexto(direita, colunaTipo)) { saida += '||'; i++; continue; }
+    }
+    saida += c;
+    i++;
+  }
+  return saida;
+}
+
+function colunaIdentidade(insert, grafia) {
+  const g = normalizarGrafia(grafia);
+  const m = /^\s*INSERT\s+INTO\s+([^\s(]+)/i.exec(insert);
+  if (!g || !g.identidades || !m) return 'id';
+  const tabela = m[1].split('.').pop().replace(/[[\]"]/g, '').toLowerCase();
+  const real = g.identidades.get(tabela);
+  if (!real) return 'id';
+  return real === real.toLowerCase() ? real : `"${real}"`;
+}
+
 function traduzir(sqlTexto, params = {}, prefixo = '@', utc = false, grafia = null) {
-  const comandos = dividirComandos(sqlTexto);
+  const comandos = dividirComandos(separarIdentidade(sqlTexto));
   const saida = [];
   for (let i = 0; i < comandos.length; i++) {
     const c = comandos[i];
     const identidade = /^\s*SELECT\s+(?:CAST\s*\(\s*)?SCOPE_IDENTITY\s*\(\s*\)(?:\s+AS\s+\w+\s*\))?\s+AS\s+(\w+)\s*$/i.exec(c) || /^\s*SELECT\s+@@IDENTITY\s+AS\s+(\w+)\s*$/i.exec(c);
     if (identidade && saida.length && /^\s*INSERT\b/i.test(comandos[i - 1])) {
-      saida[saida.length - 1] = `${saida[saida.length - 1].trimEnd()} RETURNING id AS "${identidade[1]}"`;
+      saida[saida.length - 1] = `${saida[saida.length - 1].trimEnd()} RETURNING ${colunaIdentidade(comandos[i - 1], grafia)} AS "${identidade[1]}"`;
       continue;
     }
     const contagem = /^\s*SELECT\s+@@ROWCOUNT\s+AS\s+(\w+)\s*$/i.exec(c);
@@ -466,6 +638,10 @@ function grafiaDasChaves(sqlTexto, linhas) {
 }
 
 function montarGrafia(linhas) {
+  const tipos = new Map();
+  const identidades = new Map();
+  for (const l of linhas) if (l.i) identidades.set(l.t.toLowerCase(), l.c);
+  for (const l of linhas) if (l.d) { const kt = l.t.toLowerCase(); if (!tipos.has(kt)) tipos.set(kt, new Map()); tipos.get(kt).set(l.c.toLowerCase(), l.d); }
   const esquemas = new Set(linhas.filter((l) => l.s).map((l) => l.s.toLowerCase()));
   const tabelas = new Map();
   const colunas = new Map();
@@ -480,7 +656,7 @@ function montarGrafia(linhas) {
     else if (global.get(kc) !== c) global.set(kc, null);
   }
   for (const [k, v] of tabelas) if (!global.has(k)) global.set(k, v);
-  return { tabelas, colunas, global, esquemas };
+  return { tabelas, colunas, global, esquemas, tipos, identidades };
 }
 
 const grafias = new Map();
@@ -489,7 +665,7 @@ function grafiaDoBanco(cliente) {
   const banco = (cliente && cliente.database) || process.env.PG_DATABASE || '';
   if (!grafias.has(banco)) {
     grafias.set(banco, cliente.query(`
-      SELECT c.table_schema AS s, c.table_name AS t, c.column_name AS c FROM information_schema.columns c
+      SELECT c.table_schema AS s, c.table_name AS t, c.column_name AS c, c.data_type AS d, (c.is_identity = 'YES' OR c.column_default LIKE 'nextval%') AS i FROM information_schema.columns c
       WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')`)
       .then((r) => montarGrafia(r.rows))
       .catch((e) => { grafias.delete(banco); throw e; }));
@@ -549,7 +725,7 @@ function destinoDaConsulta(sqlTexto, padrao) {
   }
   if (citados.size > 1 && !ESQUEMAS) throw new Error(`consulta cruza os bancos ${[...citados].join(', ')}, o que o PostgreSQL não faz entre bancos diferentes`);
   const padraoValido = padrao && !protheus.has(String(padrao).toLowerCase()) ? padrao : null;
-  const banco = citados.size === 1 ? [...citados][0] : (padraoValido || [...citados][0] || padrao);
+  const banco = ESQUEMAS ? (padraoValido || [...citados][0] || padrao) : (citados.size === 1 ? [...citados][0] : padrao);
   if (!banco || protheus.has(String(banco).toLowerCase())) return { tipo: 'mssql' };
   return { tipo: 'pg', banco: bancoNoPostgres(banco) };
 }
