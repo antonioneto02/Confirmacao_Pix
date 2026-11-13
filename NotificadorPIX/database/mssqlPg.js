@@ -125,6 +125,27 @@ function trocarApply(texto) {
   return saida;
 }
 
+function contarComoInteiro(texto) {
+  const re = /\bCOUNT\s*\(/i;
+  let saida = texto;
+  let m;
+  let guarda = 0;
+  while ((m = re.exec(saida)) && guarda++ < 10000) {
+    const abre = m.index + m[0].length - 1;
+    const { args, fim } = argumentos(saida, abre);
+    let final = fim + 1;
+    let janela = '';
+    const over = /^\s*OVER\s*\(/i.exec(saida.slice(final));
+    if (over) {
+      const fimOver = argumentos(saida, final + over[0].length - 1).fim;
+      janela = saida.slice(final, fimOver + 1);
+      final = fimOver + 1;
+    }
+    saida = `${saida.slice(0, m.index)}CAST(__CONTAR__(${args.join(', ')})${janela} AS INTEGER)${saida.slice(final)}`;
+  }
+  return saida.replace(/__CONTAR__\(/g, 'COUNT(');
+}
+
 function trocarTop(texto) {
   const re = /\bSELECT\s+(DISTINCT\s+)?TOP\s*(\(\s*([^)]+?)\s*\)|(\d+|[@:][A-Za-z_]\w*))(\s+PERCENT)?/i;
   let saida = texto;
@@ -173,7 +194,7 @@ function traduzirMerge(cmdOriginal) {
   if (extra || saida) {
     const fonteExtra = {};
     for (const item of dividirVirgulas(usando)) {
-      const a = /^([\s\S]+?)\s+AS\s+(\w+)$/i.exec(item);
+      const a = /^([\s\S]+?)\s+(?:AS\s+)?(\w+)$/i.exec(item);
       if (!a) throw new Error(`MERGE: item do USING sem alias: ${item}`);
       fonteExtra[a[2].toLowerCase()] = a[1];
     }
@@ -187,7 +208,7 @@ function traduzirMerge(cmdOriginal) {
   }
   const fonte = {};
   for (const item of dividirVirgulas(usando)) {
-    const a = /^([\s\S]+?)\s+AS\s+(\w+)$/i.exec(item);
+    const a = /^([\s\S]+?)\s+(?:AS\s+)?(\w+)$/i.exec(item);
     if (!a) throw new Error(`MERGE: item do USING sem alias: ${item}`);
     fonte[a[2].toLowerCase()] = a[1];
   }
@@ -246,17 +267,35 @@ function itemDeSelect(antes, depois) {
 
 const NAO_APELIDO = /^(WHERE|ON|JOIN|GROUP|ORDER|UNION|LEFT|INNER|CROSS|OUTER|RIGHT|FULL|HAVING|LIMIT|OFFSET|AND|OR|AS|SELECT|FROM|SET|VALUES|RETURNING)$/i;
 
-function derivadas(semTexto) {
+function subconsultasDe(semTexto) {
   const lista = [];
   for (let i = 0; i < semTexto.length; i++) {
-    if (semTexto[i] !== '(' || !/^\(\s*SELECT\b/i.test(semTexto.slice(i, i + 40))) continue;
+    if (semTexto[i] !== '(' || !/^\(\s*(SELECT|WITH)\b/i.test(semTexto.slice(i, i + 40))) continue;
     let n = 0;
     let j = i;
     for (; j < semTexto.length; j++) { if (semTexto[j] === '(') n++; else if (semTexto[j] === ')') { n--; if (n === 0) break; } }
     const a = /^\s*(?:AS\s+)?"?([A-Za-z_][\w$]*)"?/i.exec(semTexto.slice(j + 1));
-    if (a && !NAO_APELIDO.test(a[1])) lista.push({ nome: a[1].toLowerCase(), ini: i, fim: j });
+    lista.push({ nome: a && !NAO_APELIDO.test(a[1]) ? a[1].toLowerCase() : null, ini: i, fim: j });
   }
   return lista;
+}
+
+function derivadas(semTexto) {
+  return subconsultasDe(semTexto).filter((d) => d.nome);
+}
+
+function escoposDe(semTexto, g) {
+  const escopos = [{ ini: -1, fim: semTexto.length }, ...subconsultasDe(semTexto)];
+  for (const e of escopos) {
+    let proprio = semTexto.slice(e.ini + 1, e.fim).split('');
+    for (const filho of escopos) {
+      if (filho === e || filho.ini <= e.ini || filho.fim >= e.fim) continue;
+      for (let k = filho.ini; k <= filho.fim; k++) proprio[k - e.ini - 1] = ' ';
+    }
+    proprio = proprio.join('');
+    e.tabelas = referencias(proprio, g).tabelas;
+  }
+  return escopos;
 }
 
 function ajustarGrafia(t, grafiaBruta) {
@@ -266,13 +305,14 @@ function ajustarGrafia(t, grafiaBruta) {
   const legado = !g.colunas.size;
   const semTextoIgual = t.replace(/'(?:[^']|'')*'/g, (x) => "'" + ' '.repeat(x.length - 2) + "'");
   const subconsultas = derivadas(semTextoIgual);
+  const escopos = escoposDe(semTextoIgual, g);
   const daSubconsulta = (qualificador, onde) => {
     const k = qualificador.toLowerCase();
     const mesmas = subconsultas.filter((d) => d.nome === k);
     return mesmas.length > 0 && !mesmas.some((d) => onde > d.ini && onde < d.fim);
   };
   const apelidosSaida = new Set([...t.replace(/'(?:[^']|'')*'/g, "''").matchAll(/\bAS\s+"?([A-Za-z_][A-Za-z0-9_$]*)"?/gi)].map((m) => m[1]));
-  const coluna = (nome, qualificador) => {
+  const coluna = (nome, qualificador, onde) => {
     const k = nome.toLowerCase();
     if (qualificador) {
       const tabela = aliasTabela.get(qualificador.toLowerCase());
@@ -280,17 +320,33 @@ function ajustarGrafia(t, grafiaBruta) {
       if (cols && cols.has(k)) return cols.get(k);
       return legado ? (g.global.get(k) || undefined) : undefined;
     }
-    for (const tabela of usadas) {
-      const cols = g.colunas.get(tabela);
-      if (cols && cols.has(k)) return cols.get(k);
+    const visiveis = legado || onde === undefined
+      ? [usadas]
+      : escopos.filter((e) => onde > e.ini && onde < e.fim).sort((a, b) => (a.fim - a.ini) - (b.fim - b.ini)).map((e) => e.tabelas);
+    for (const lista of visiveis) {
+      for (const tabela of lista) {
+        const cols = g.colunas.get(tabela);
+        if (cols && cols.has(k)) return cols.get(k);
+      }
     }
     return legado || !usadas.length ? (g.global.get(k) || undefined) : undefined;
   };
+  const especial = (nome, onde) => {
+    const k = nome.toLowerCase();
+    const visiveis = escopos.filter((e) => onde > e.ini && onde < e.fim).sort((a, b) => (a.fim - a.ini) - (b.fim - b.ini));
+    for (const e of visiveis) {
+      for (const tabela of e.tabelas) {
+        const cols = g.colunas.get(tabela);
+        if (cols && cols.has(k)) return cols.get(k);
+      }
+    }
+    return g.global.get(k) || nome;
+  };
   let deslocamento = 0;
-  return t.split(/('(?:[^']|'')*')/).map((parte, indice) => {
+  return t.split(/('(?:[^']|'')*'|"(?=[^"\n]*[^A-Za-z0-9_$"\n])[\p{L}\d_%#][^"\n]*")/u).map((parte, indice) => {
     const base = deslocamento;
     deslocamento += parte.length;
-    if (indice % 2) return parte;
+    if (indice % 2) return parte.startsWith('"') ? `"${especial(parte.slice(1, -1), base)}"` : parte;
     return parte.replace(/(?<![\w$"])("?)([A-Za-z_][A-Za-z0-9_$]*)\1(?![\w$"])/g, (inteiro, aspas, nome, pos, todo) => {
     const antes = todo.slice(0, pos);
     const depois = todo.slice(pos + inteiro.length);
@@ -307,7 +363,7 @@ function ajustarGrafia(t, grafiaBruta) {
     else {
       const q = /([A-Za-z_][\w$]*)"?\s*\.\s*$/.exec(antes);
       if (q && daSubconsulta(q[1], base + pos)) return inteiro;
-      real = coluna(nome, q ? q[1] : null);
+      real = coluna(nome, q ? q[1] : null, base + pos);
     }
     if (!real) return inteiro;
     if (real === real.toLowerCase()) return aspas ? real : inteiro;
@@ -327,6 +383,56 @@ function traduzirSeNaoExiste(cmd) {
   return `${insercao[1]} SELECT ${insercao[2]} WHERE NOT EXISTS (${sub})`;
 }
 
+function posicaoNoTopo(texto, re, inicio = 0) {
+  const semTexto = texto.replace(/'(?:[^']|'')*'/g, (x) => "'" + ' '.repeat(x.length - 2) + "'");
+  let n = 0;
+  for (let i = inicio; i < semTexto.length; i++) {
+    const c = semTexto[i];
+    if (c === '(') n++;
+    else if (c === ')') n--;
+    else if (n === 0 && (i === 0 || /[\s)]/.test(semTexto[i - 1]))) {
+      const m = re.exec(semTexto.slice(i));
+      if (m && m.index === 0) return { i, m };
+    }
+  }
+  return null;
+}
+
+function comRecursivo(t) {
+  const inicio = /^\s*WITH\s+(?!RECURSIVE\b)/i.exec(t);
+  if (!inicio) return t;
+  let i = inicio[0].length;
+  for (;;) {
+    const cab = /^\s*"?([A-Za-z_][\w$]*)"?\s*(\([^()]*\))?\s*AS\s*\(/i.exec(t.slice(i));
+    if (!cab) return t;
+    const abre = i + cab[0].length - 1;
+    const { fim } = argumentos(t, abre);
+    const corpo = t.slice(abre + 1, fim).replace(/'(?:[^']|'')*'/g, "''");
+    if (new RegExp(String.raw`\b(FROM|JOIN)\s+"?${cab[1]}"?(?![\w$])`, 'i').test(corpo)) return t.replace(/^(\s*WITH)\s+/i, '$1 RECURSIVE ');
+    const virgula = /^\s*,/.exec(t.slice(fim + 1));
+    if (!virgula) return t;
+    i = fim + 1 + virgula[0].length;
+  }
+}
+
+function traduzirUpdateFrom(t) {
+  const upd = posicaoNoTopo(t, /UPDATE\s+("?[A-Za-z_][\w$]*"?)\s+SET\b/iy);
+  if (!upd) return t;
+  const alvo = upd.m[1].replace(/"/g, '');
+  const inicioSets = upd.i + upd.m[0].length;
+  const de = posicaoNoTopo(t, /FROM\b/iy, inicioSets);
+  if (!de) return t;
+  const onde = posicaoNoTopo(t, /WHERE\b/iy, de.i);
+  const fimFrom = onde ? onde.i : t.length;
+  const fromTexto = t.slice(de.i + 4, fimFrom);
+  const item = new RegExp(String.raw`^\s*((?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?)\s+(?:AS\s+)?"?${alvo}"?(?![\w$])`, 'i').exec(fromTexto)
+    || new RegExp(String.raw`\bJOIN\s+((?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?)\s+(?:AS\s+)?"?${alvo}"?(?![\w$])`, 'i').exec(fromTexto);
+  if (!item) return t;
+  const sets = dividirVirgulas(t.slice(inicioSets, de.i)).map((x) => x.replace(new RegExp(String.raw`^\s*"?${alvo}"?\s*\.\s*`, 'i'), ' ').trim());
+  const resto = onde ? t.slice(onde.i + onde.m[0].length) : '';
+  return `${t.slice(0, upd.i)}UPDATE ${item[1]} AS __alvo SET ${sets.join(', ')} FROM${fromTexto.trimEnd()} WHERE __alvo.ctid = ${alvo}.ctid${onde ? ` AND (${resto.trim()})` : ''}`;
+}
+
 function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   const cmd = traduzirSeNaoExiste(cmdOriginal);
   const prefixoBanco = (inteiro, banco) => (ESQUEMAS && !bancosProtheus().has(banco.toLowerCase()) ? `"${bancoNoPostgres(banco)}".` : '');
@@ -336,7 +442,12 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   if (catalogo) t = t.replace(/'([^']*)'/g, (_m, s) => `'${s.toLowerCase()}'`);
   t = foraDeTexto(t, (p) => p.replace(/\[?dbo\]?\./gi, ''));
   const minusculas = Object.keys(carregarMapa()).length > 0;
-  t = foraDeTexto(t, (p) => p.replace(/\[([A-Za-z_][A-Za-z0-9_ ]*)\]/g, (_m, n) => (!minusculas && /[A-Z]/.test(n) && /[a-z]/.test(n) ? `"${n}"` : n)));
+  t = foraDeTexto(t, (p) => p.replace(/\[([^\]\n]+)\]/g, (_m, n) => {
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) return !minusculas && /[A-Z]/.test(n) && /[a-z]/.test(n) ? `"${n}"` : n;
+    return `"${minusculas ? n.toLowerCase() : n}"`;
+  }));
+  t = traduzirUpdateFrom(t);
+  t = comRecursivo(t);
   t = trocarFuncao(t, 'STUFF', (args) => {
     const m = /^\(\s*SELECT\s+('(?:[^']|'')*')\s*\+\s*([\s\S]+?)\s+FROM\s+([\s\S]+?)\s+FOR\s+XML\s+PATH\s*\(\s*''\s*\)(?:\s*,\s*TYPE)?\s*\)(?:\s*\.value\s*\(\s*'[^']*'\s*,\s*'[^']*'\s*\))?$/i.exec(args[0] || '');
     if (m && args[1] === '1' && /^''$/.test(args[3] || '')) return `(SELECT STRING_AGG(CAST(${m[2]} AS TEXT), ${m[1]}) FROM ${m[3]})`;
@@ -351,6 +462,9 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   t = t.replace(/\s+COLLATE\s+[A-Za-z0-9_]+/gi, '');
   t = t.replace(/\bISNULL\s*\(/gi, 'COALESCE(');
   t = t.replace(/\bLEN\s*\(/gi, 'LENGTH(');
+  t = trocarFuncao(t, 'EOMONTH', ([d, n]) => `CAST(date_trunc('month', CAST(${d} AS TIMESTAMP)${n ? ` + (${n}) * INTERVAL '1 month'` : ''}) + INTERVAL '1 month' - INTERVAL '1 day' AS DATE)`);
+  t = trocarFuncao(t, 'DATEFROMPARTS', ([a, m, d]) => `make_date(CAST(${a} AS INTEGER), CAST(${m} AS INTEGER), CAST(${d} AS INTEGER))`);
+  t = trocarFuncao(t, 'ISDATE', ([x]) => `(CASE WHEN CAST(${x} AS TEXT) ~ '^\\s*[0-9]{4}-?[0-9]{2}-?[0-9]{2}' THEN 1 ELSE 0 END)`);
   const conversaoSegura = (tipo, expr) => {
     const nome = String(tipo).trim().toUpperCase();
     let padrao = null;
@@ -366,7 +480,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   });
   t = t.replace(/\bNEWID\s*\(\s*\)/gi, 'gen_random_uuid()');
   for (const [re, novo] of TIPOS_CAST) t = t.replace(re, novo);
-  t = t.replace(/\bNOT\s+LIKE\b/gi, 'NOT ILIKE').replace(/(?<!NOT\s)\bLIKE\b/gi, 'ILIKE');
+  t = t.replace(/(?<![@:\w])NOT\s+LIKE\b/gi, 'NOT ILIKE').replace(/(?<!NOT\s)(?<![@:\w])LIKE\b/gi, 'ILIKE');
   t = trocarFuncao(t, 'ISJSON', ([expr]) => `__ISJSON__(${expr})`);
   t = t.replace(/__ISJSON__\(([\s\S]*?)\)\s*=\s*1/g, '(($1) IS JSON)').replace(/__ISJSON__\(([\s\S]*?)\)\s*=\s*0/g, '(($1) IS NOT JSON)');
   t = trocarFuncao(t, 'JSON_VALUE', ([expr, caminho]) => {
@@ -374,6 +488,14 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
     return partes.length === 1 ? `(CAST(${expr} AS jsonb) ->> '${partes[0]}')` : `(CAST(${expr} AS jsonb) #>> '{${partes.join(',')}}')`;
   });
   t = trocarFuncao(t, 'DATEADD', ([unidade, n, base]) => `(CAST(${base} AS TIMESTAMP) + (${n}) * INTERVAL '1 ${UNIDADES[unidade.toLowerCase()] || unidade}')`);
+  t = trocarFuncao(t, 'DATEPART', ([unidade, expr]) => {
+    const bruto = unidade.trim().toLowerCase();
+    if (['weekday', 'dw', 'w'].includes(bruto)) return `CAST(EXTRACT(DOW FROM CAST(${expr} AS TIMESTAMP)) + 1 AS INTEGER)`;
+    if (['dayofyear', 'dy', 'y'].includes(bruto)) return `CAST(EXTRACT(DOY FROM CAST(${expr} AS TIMESTAMP)) AS INTEGER)`;
+    if (['iso_week', 'isowk', 'isoww'].includes(bruto)) return `CAST(EXTRACT(WEEK FROM CAST(${expr} AS TIMESTAMP)) AS INTEGER)`;
+    const u = UNIDADES[bruto] || bruto;
+    return `CAST(FLOOR(EXTRACT(${u.toUpperCase()} FROM CAST(${expr} AS TIMESTAMP))) AS INTEGER)`;
+  });
   t = trocarFuncao(t, 'DATEDIFF', ([unidade, a, b]) => {
     const u = UNIDADES[unidade.toLowerCase()] || unidade.toLowerCase();
     if (u === 'day') return `(CAST(${b} AS DATE) - CAST(${a} AS DATE))`;
@@ -408,7 +530,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
   });
   t = trocarFuncao(t, 'CHARINDEX', ([agulha, palheiro]) => `POSITION((${agulha}) IN (${palheiro}))`);
   t = trocarFuncao(t, 'IIF', ([cond, a, b]) => `(CASE WHEN ${cond} THEN ${a} ELSE ${b} END)`);
-  t = trocarFuncao(t, 'COUNT', (args) => `CAST(__CONTAR__(${args.join(', ')}) AS INTEGER)`).replace(/__CONTAR__\(/g, 'COUNT(');
+  t = contarComoInteiro(t);
   t = trocarFuncao(t, 'SUM', (args) => `CAST(__SOMAR__(${args.join(', ')}) AS DOUBLE PRECISION)`).replace(/__SOMAR__\(/g, 'SUM(');
   const apelidos = new Set();
   t = t.replace(/\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b/g, (inteiro, nome) => {
@@ -434,7 +556,7 @@ function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
     const v = params[chave];
     return literal(catalogo && typeof v === 'string' ? v.toLowerCase() : v, utc);
   });
-  return catalogo ? t : ajustarGrafia(concatenar(t, grafia), grafia);
+  return catalogo ? t : ajustarGrafia(numerosComoTexto(concatenar(t, grafia), grafia), grafia);
 }
 
 function ehDdlSqlServer(c) {
@@ -502,19 +624,42 @@ function ehTexto(op, colunaTipo) {
   return false;
 }
 
+function tipoDeColuna(g, refs, op) {
+  if (!g || !g.tipos || !refs) return null;
+  const partes = op.replace(/"/g, '').split('.').map((x) => x.trim().toLowerCase());
+  const col = partes.pop();
+  const tabelas = partes.length ? [refs.apelidos.get(partes[0])].filter(Boolean) : refs.tabelas;
+  for (const tabela of tabelas) {
+    const tipo = g.tipos.get(tabela) && g.tipos.get(tabela).get(col);
+    if (tipo) return tipo;
+  }
+  return null;
+}
+
+const COLUNA_REF = String.raw`(?<![\w$".])((?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?)`;
+const NUMERO = String.raw`(-?\d+(?:\.\d+)?)(?![\w.])`;
+
+function numerosComoTexto(t, grafia) {
+  const g = normalizarGrafia(grafia);
+  if (!g || !g.tipos || !g.tipos.size) return t;
+  const refs = referencias(t, g);
+  const texto = (op) => {
+    if (PALAVRAS_SQL.has(op.replace(/"/g, '').toUpperCase())) return false;
+    const tipo = tipoDeColuna(g, refs, op);
+    return !!tipo && /char|text/i.test(tipo);
+  };
+  return foraDeTexto(t, (p) => p
+    .replace(new RegExp(String.raw`${COLUNA_REF}(\s*(?:=|<>|!=|>=|<=|>|<)\s*)${NUMERO}`, 'g'), (m, col, op, num) => (texto(col) ? `${col}${op}'${num}'` : m))
+    .replace(/(?<![\w$".])(-?\d+(?:\.\d+)?)(\s*(?:=|<>|!=)\s*)((?:"?[A-Za-z_][\w$]*"?\s*\.\s*)?"?[A-Za-z_][\w$]*"?)(?![\w$"(.])/g,(m, num, op, col) => (texto(col) ? `'${num}'${op}${col}` : m))
+    .replace(new RegExp(String.raw`${COLUNA_REF}(\s+(?:NOT\s+)?IN\s*\()(\s*-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?)*\s*)\)`, 'gi'), (m, col, abre, lista) => (texto(col) ? `${col}${abre}${lista.split(',').map((x) => `'${x.trim()}'`).join(', ')})` : m)));
+}
+
 function concatenar(t, grafia) {
   const g = normalizarGrafia(grafia);
   const refs = g && g.colunas.size ? referencias(t, g) : null;
   const colunaTipo = (op) => {
-    if (!g || !g.tipos) return false;
-    const partes = op.replace(/"/g, '').split('.').map((x) => x.trim().toLowerCase());
-    const col = partes.pop();
-    const tabelas = partes.length ? [refs && refs.apelidos.get(partes[0])].filter(Boolean) : (refs ? refs.tabelas : []);
-    for (const tabela of tabelas) {
-      const tipo = g.tipos.get(tabela) && g.tipos.get(tabela).get(col);
-      if (tipo) return /char|text|uuid/i.test(tipo);
-    }
-    return false;
+    const tipo = tipoDeColuna(g, refs, op);
+    return !!tipo && /char|text|uuid/i.test(tipo);
   };
   let saida = '';
   let i = 0;
@@ -544,11 +689,39 @@ function colunaIdentidade(insert, grafia) {
   return real === real.toLowerCase() ? real : `"${real}"`;
 }
 
+function usarVariaveis(texto, vars) {
+  if (!vars.size) return texto;
+  return foraDeTexto(texto, (p) => p.replace(/(?<![@\w])@(\w+)(?!\w)/g, (m, n) => {
+    const v = vars.get(n.toLowerCase());
+    return v ? `CAST((${v.valor}) AS ${v.tipo})` : m;
+  }));
+}
+
+function declararVariaveis(c, vars) {
+  const dec = /^\s*DECLARE\s+([\s\S]+)$/i.exec(c);
+  if (dec) {
+    for (const item of dividirVirgulas(dec[1])) {
+      const m = /^@(\w+)\s+(?:AS\s+)?([A-Za-z]\w*(?:\s*\(\s*(?:\d+|MAX)(?:\s*,\s*\d+)?\s*\))?)\s*(?:=\s*([\s\S]+))?$/i.exec(item.trim());
+      if (!m || /^TABLE$/i.test(m[2])) throw new Error('DECLARE de variável de tabela não é suportado no PostgreSQL; escreva a variante desta consulta');
+      vars.set(m[1].toLowerCase(), { tipo: m[2], valor: m[3] ? usarVariaveis(m[3].trim(), vars) : 'NULL' });
+    }
+    return true;
+  }
+  const set = /^\s*SET\s+@(\w+)\s*=\s*([\s\S]+)$/i.exec(c);
+  if (set && vars.has(set[1].toLowerCase())) {
+    vars.get(set[1].toLowerCase()).valor = usarVariaveis(set[2].trim(), vars);
+    return true;
+  }
+  return false;
+}
+
 function traduzir(sqlTexto, params = {}, prefixo = '@', utc = false, grafia = null) {
   const comandos = dividirComandos(separarIdentidade(sqlTexto));
   const saida = [];
+  const variaveis = new Map();
   for (let i = 0; i < comandos.length; i++) {
-    const c = comandos[i];
+    if (declararVariaveis(comandos[i], variaveis)) continue;
+    const c = usarVariaveis(comandos[i], variaveis);
     const identidade = /^\s*SELECT\s+(?:CAST\s*\(\s*)?SCOPE_IDENTITY\s*\(\s*\)(?:\s+AS\s+\w+\s*\))?\s+AS\s+(\w+)\s*$/i.exec(c) || /^\s*SELECT\s+@@IDENTITY\s+AS\s+(\w+)\s*$/i.exec(c);
     if (identidade && saida.length && /^\s*INSERT\b/i.test(comandos[i - 1])) {
       saida[saida.length - 1] = `${saida[saida.length - 1].trimEnd()} RETURNING ${colunaIdentidade(comandos[i - 1], grafia)} AS "${identidade[1]}"`;
