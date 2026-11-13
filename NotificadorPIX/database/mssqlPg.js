@@ -511,14 +511,21 @@ function traduzirUpdateFrom(t) {
 }
 
 function traduzirExec(cmd) {
-  const m = /^\s*EXEC(?:UTE)?\s+(?!sp_)((?:\[?[A-Za-z_]\w*\]?\.){0,2}\[?[A-Za-z_]\w*\]?)\s*([\s\S]*?)\s*$/i.exec(cmd);
-  if (!m) return cmd;
-  const args = m[2] ? dividirVirgulas(m[2]).map((a) => a.replace(/^@\w+\s*=\s*/, '')) : [];
+  const m = /^\s*EXEC(?:UTE)?\s+((?:\[?[A-Za-z_]\w*\]?\.){0,2}\[?[A-Za-z_]\w*\]?)\s*([\s\S]*?)\s*$/i.exec(cmd);
+  if (!m || /^(\[?\w+\]?\.)*\[?sp_/.test(m[1])) return cmd;
+  const args = m[2] ? dividirVirgulas(m[2]).map((a) => a.replace(/^@\w+\s*=\s*/, '').replace(/\s+OUT(?:PUT)?\s*$/i, '')) : [];
   return `CALL ${m[1]}(${args.join(', ')})`;
 }
 
+function cteAtualizavel(cmd) {
+  const m = /^\s*WITH\s+(\w+)\s+AS\s*\(\s*SELECT\s+TOP\s*\(?\s*([^)\s]+)\s*\)?\s+\*\s+FROM\s+([^\s(]+)(\s+[\s\S]*?)?\)\s*UPDATE\s+(\w+)\s+SET\s+([\s\S]+?)(\s+OUTPUT\s+[\s\S]+?)?\s*;?\s*$/i.exec(cmd);
+  if (!m || m[1].toLowerCase() !== m[5].toLowerCase()) return cmd;
+  const [, , limite, tabela, resto = '', , sets, saida = ''] = m;
+  return `UPDATE ${tabela} SET ${sets} WHERE ctid IN (SELECT ctid FROM ${tabela}${resto} LIMIT ${limite} FOR UPDATE SKIP LOCKED)${saida}`;
+}
+
 function traduzirComando(cmdOriginal, params, prefixo, utc, grafia) {
-  const cmd = traduzirExec(traduzirSeNaoExiste(cmdOriginal));
+  const cmd = traduzirExec(traduzirSeNaoExiste(cteAtualizavel(cmdOriginal)));
   const prefixoBanco = (inteiro, banco) => (ESQUEMAS && !bancosProtheus().has(banco.toLowerCase()) ? `"${bancoNoPostgres(banco)}".` : '');
   let t = foraDeTexto(cmd, (p) => p.replace(/\[?([A-Za-z_]\w*)\]?\.\[?dbo\]?\.(?=\[?[A-Za-z_#])/gi, prefixoBanco).replace(/(?<![\w\]."])\[?([A-Za-z_]\w*)\]?\.\.(?=\[?[A-Za-z_#])/g, prefixoBanco));
   if (/^\s*MERGE\b/i.test(t)) t = traduzirMerge(t.replace(/\[?dbo\]?\./gi, '').replace(/\[([A-Za-z_][A-Za-z0-9_ ]*)\]/g, '$1').replace(/\bWITH\s*\(\s*HOLDLOCK\s*\)/gi, ''));
@@ -658,7 +665,8 @@ function ehDdlSqlServer(c) {
   if (/^\s*SET\s+(NOCOUNT|XACT_ABORT|ANSI_|QUOTED_IDENTIFIER|DATEFORMAT|LANGUAGE)\b/i.test(c)) return true;
   if (/^\s*(BEGIN|END)\s*$/i.test(c)) return true;
   if (/^\s*IF\b/i.test(c) && /\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|UNIQUE|NONCLUSTERED|CLUSTERED|VIEW|PROCEDURE|FUNCTION)\b|\bsp_rename\b/i.test(c)) return true;
-  if (/^\s*(BEGIN\s+)?(CREATE\s+(TABLE|UNIQUE|INDEX|NONCLUSTERED|CLUSTERED)|ALTER\s+TABLE|DROP\s+(TABLE|INDEX)|EXEC(UTE)?\s+sp_)/i.test(c)) return true;
+  if (/^\s*(BEGIN\s+)?(CREATE\s+(TABLE|UNIQUE|INDEX|NONCLUSTERED|CLUSTERED)|ALTER\s+TABLE|DROP\s+(TABLE|INDEX))/i.test(c)) return true;
+  if (/^\s*(BEGIN\s+)?[Ee][Xx][Ee][Cc]\w*\s+(\[?\w+\]?\.)*\[?sp_/.test(c)) return true;
   return false;
 }
 
@@ -839,8 +847,14 @@ function traduzir(sqlTexto, params = {}, prefixo = '@', utc = false, grafia = nu
   const comandos = dividirComandos(separarIdentidade(upsertPorRowcount(semComentarios(sqlTexto))));
   const saida = [];
   const variaveis = new Map();
+  const saidasExec = new Set();
   for (let i = 0; i < comandos.length; i++) {
     if (/\bsys\.(?:columns|tables|objects|key_constraints|indexes|index_columns|foreign_keys|default_constraints|schemas)\b|\bOBJECT_ID\s*\(|\bEXEC(?:UTE)?\s*\(/i.test(comandos[i])) continue;
+    const execSaida = /^\s*EXEC(?:UTE)?\s+[\s\S]*?@(\w+)\s+OUT(?:PUT)?\b/i.test(comandos[i]);
+    if (execSaida) for (const s of comandos[i].matchAll(/@(\w+)\s+OUT(?:PUT)?\b/gi)) saidasExec.add(s[1].toLowerCase());
+    const soSaidas = /^\s*SELECT\s+@\w+(?:\s+AS\s+\w+)?(?:\s*,\s*@\w+(?:\s+AS\s+\w+)?)*\s*$/i.test(comandos[i])
+      && [...comandos[i].matchAll(/@(\w+)/g)].every((x) => saidasExec.has(x[1].toLowerCase()));
+    if (soSaidas) continue;
     if (declararVariaveis(comandos[i], variaveis)) continue;
     const c = usarVariaveis(comandos[i], variaveis);
     const identidade = /^\s*SELECT\s+(?:CAST\s*\(\s*)?SCOPE_IDENTITY\s*\(\s*\)(?:\s+AS\s+\w+\s*\))?\s+AS\s+(\w+)\s*$/i.exec(c) || /^\s*SELECT\s+@@IDENTITY\s+AS\s+(\w+)\s*$/i.exec(c);
